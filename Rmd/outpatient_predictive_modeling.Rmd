@@ -1,0 +1,2852 @@
+---
+title: "Outpatient predictive modeling"
+author: "Christelle Colin-Leitzinger"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: false
+    theme: united
+    highlight: pygments
+    df_print: paged
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+<style type= "text/css">
+
+. figure {
+   margin-top: 25px;
+   margin-bottom: 100px;
+}
+
+table {
+    margin-top: 10px;
+    margin-bottom: 25px;
+}
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,
+                      warning = FALSE,
+                      message = FALSE,
+                      cache = FALSE,
+                      fig.align='center'
+                      )
+```
+
+```{r library}
+library(here)
+library(tidyverse)
+library(ggplot2)
+library(gtsummary)
+library(labelled)
+library(DescTools)
+library(survival)
+library(survminer)
+library(StepReg)
+library(caret)
+library(pROC)
+library(splitTools)
+theme_set(theme_classic())
+theme_gtsummary_compact()
+```
+
+```{r load}
+path_raw <- fs::path("","Volumes","Peres_Research", "Myeloma", "Consortium Data", "May 2025")
+path_save <- fs::path("","Volumes","Peres_Research", "Myeloma", "Analyses", "")
+
+load(paste0(#path_raw, 
+           here(), "/data",
+           "/Cleaned_Consortium_Datasets_29Jul2025.RData"))
+rm(combined_abecma, combined_iec, combined_aml)
+```
+
+This project aims to build a predictive model to identify low-risk CAR T patients that could be managed in the outpatient setting. I’ve provided some information on how to define the low-risk patients (the outcome) and potential predictors below.
+
+Outcome
+1 = patients with no CRS or grade 1 CRS, no ICANS, and no IEC-HS
+0 = patients with grade 2 or higher CRS, patients with any ICANS, and patients with IEC-HS
+ 
+Potential predictors
+Focus on baseline patient characteristics (can look at pt characteristics tables from prior papers – like PMID: 39365257):
+
+From Doris:
+We should probably consider adding CAR-T cell dose of <0.7 or >/=0.7            cart_infusion_dose?
+
+```{r case cleaning}
+combined_cart <- combined_cart %>% 
+  # General
+  # Fix letter case
+  mutate(across(c(where(is.character),
+                  -c("patientid",
+                     "heavychain",
+                     "bridging_response",
+                     "r_iss", "updated_death_cause",
+                     "eligible_cartitude1_reason",
+                     contains("response"),
+                     starts_with("ORR_"),
+                     starts_with("CRorbetter")
+                     )),
+                ~ str_to_sentence(.) )) %>% 
+  mutate(across(c("updated_death_cause", "Site"), 
+                ~ str_to_lower(.)))
+```
+
+
+```{r general cleaning}
+data1 <- combined_cart %>% 
+  mutate(Site1 = str_replace_all(Site, " ", "_")) %>% 
+  unite(col = patientid, c(cart_dataset, patientid, Site1), 
+        sep = "-", 
+        remove = FALSE) %>% 
+  select(-Site1) %>% 
+  # Fix numerical
+  mutate_at(c("age_cart"
+                  ), 
+                ~ as.numeric(.)) %>%
+  # Sex categories
+  mutate(male_sex = case_when(
+    sex == "Male"                                    ~ 1,
+    sex == "Female"                                  ~ 0
+  )) %>% 
+  # ECOG
+  mutate(ecog_apheresis_cat = case_when(
+    ecog_apheresis == 0 |
+      ecog_apheresis == 1                            ~ "0-1",
+    ecog_apheresis %in% c(2:4)                       ~ "2-4"
+  ), .after = ecog_apheresis) %>%
+  mutate(ecog_at_ld_cat = case_when(
+    ecog_ld == 0 |
+      ecog_ld == 1                                   ~ "0-1",
+    ecog_ld %in% c(2:4)                              ~ "2-4"
+  ), .after = ecog_ld) %>%
+  mutate_at(c("ecog_apheresis", "ecog_ld"), ~ factor(.)) %>% 
+  # Cytogenetics ----
+  mutate(cytogenetics = case_when(
+    deletion_17p_tp53 == "Yes" | 
+      t_414_yn == "Yes" | 
+      t_1416_yn == "Yes"             ~ "Yes",
+    deletion_17p_tp53 == "No" &
+      t_414_yn == "No" &
+      t_1416_yn == "No"               ~ "No",
+    TRUE                                                           ~ NA_character_
+  ), .before = deletion_17p_tp53) #%>% 
+  
+  
+  # Fix date
+  # mutate(across(c("date_of_diagnosis"), 
+  #        ~ as.Date(as.numeric(.), origin = "1899-12-30"))) #%>% 
+  # mutate_at(c("date_of_diagnosis",
+  #             "labs_max_crp_dt", 
+  #             "max_crs_dt", 
+  #             "max_icans_dt"), ~ as.Date(., format = "%m/%d/%y"))
+
+
+# Updated cause of death data and NRM
+# data1 <- data1 %>% 
+#   mutate(updated_death_cause = case_when(
+#     # str_detect(patientid, "LCI-14") | str_detect(patientid, "LCI-25") | str_detect(patientid, "LCI-26")        ~ "infection",
+#     # str_detect(patientid, "LCI-16")                                                        ~ "spm",
+#     # str_detect(patientid, "LCI-23") | str_detect(patientid, "LCI-55") | str_detect(patientid, "LCI-67") | 
+#     #   str_detect(patientid, "LCI-74") | str_detect(patientid, "LCI-76") | str_detect(patientid, "LCI-79") | 
+#     #   str_detect(patientid, "CAR002") | str_detect(patientid, "MCC-CAR8")                            ~ "myeloma",
+#     # Site == "mdacc" & str_detect(patientid, "44")                                          ~ "myeloma",
+#     # str_detect(patientid, "LCI-73")                                                        ~ "icans",
+#     # str_detect(patientid, "LCI-77")                                                        ~ "iec",
+#     # Site=="mdacc" & str_detect(patientid, "91")                                            ~ "crs",
+#     # str_detect(patientid, "LCI-15")                                                        ~ "unknown",
+#     # str_detect(patientid, "MCC-CAR88")                                                     ~ "unknown",
+#     Site=="hackensack" & str_detect(patientid, "21")                                       ~ "unknown",
+#     TRUE                                                                         ~ updated_death_cause
+#   )) #%>% 
+  # mutate(NRM = case_when(
+  #   str_detect(patientid, "LCI-14" | str_detect(patientid, "LCI-25" | str_detect(patientid, "LCI-26"        ~ 1,
+  #   str_detect(patientid, "LCI-16"                                                       ~ 1,
+  #   str_detect(patientid, "LCI-23" | str_detect(patientid, "LCI-55" | str_detect(patientid, "LCI-67" | 
+  #     str_detect(patientid, "LCI-74" | str_detect(patientid, "LCI-76" | str_detect(patientid, "LCI-79" | 
+  #     str_detect(patientid, "CAR002" | str_detect(patientid, "MCC-CAR8"                            ~ 0,
+  #   Site == "mdacc" & str_detect(patientid, "44"                            ~ 0,
+  #   str_detect(patientid, "LCI-73"                                                       ~ 1,
+  #   str_detect(patientid, "LCI-77"                                                       ~ 1,
+  #   Site=="mdacc" & str_detect(patientid, "91"                                                       ~ 1,
+  #   str_detect(patientid, "LCI-15"                                                       ~ NA_real_,
+  #   str_detect(patientid, "MCC-CAR88"                                                       ~ NA_real_,
+  #   Site=="hackensack" & str_detect(patientid, "21"                                                       ~ NA_real_,
+  #   TRUE                                                                                  ~ NRM
+  # ))
+```
+
+```{r therapy}
+data1 <- data1 %>%
+  # CART dose
+  mutate(cart_infusion_dose = as.numeric(cart_infusion_dose)) %>% 
+  mutate(cart_cell_dose_cat = case_when(
+    cart_infusion_dose < 0.7                   ~ "< 0.7",
+    cart_infusion_dose >= 0.7                  ~ "≥ 0.7"
+  )) %>% 
+  mutate(prior_tx_cat = case_when(
+    prior_tx_lines <= 3                        ~ "1-3",
+    prior_tx_lines <= 5                        ~ "4-5",
+    prior_tx_lines >= 6                        ~ "≥6"
+  ), prior_tx_cat = factor(prior_tx_cat, levels = 
+                             c("1-3", "4-5", "≥6")
+  )) %>% 
+  mutate(condition_therapy = case_when(
+    str_detect(str_to_lower(condition_therapy), "flu") &
+      str_detect(str_to_lower(condition_therapy), "cy")       ~ "fludarabine + cytoxan",
+    str_detect(str_to_lower(condition_therapy), "clad") &
+      str_detect(str_to_lower(condition_therapy), "cy")       ~ "cladribine + cytoxan",
+    TRUE                                                      ~ str_to_lower(condition_therapy)
+  )) %>% 
+  mutate(txhistory_priorbmca_list = case_when(
+    txhistory_priorbmca_list == "None" |
+      txhistory_priorbmca_list == "No" |
+      txhistory_priorbmca_list == "N/a" |
+      txhistory_priorbmca_list == "Na"         ~ NA_character_,
+    TRUE                                       ~ txhistory_priorbmca_list
+  )) %>% 
+  # BCMA
+  mutate(prior_bcma_therapy = case_when(
+    !is.na(txhistory_priorbmca_list)           ~ "Yes",
+    str_detect(
+      str_to_upper(eligible_cartitude1_reason), 
+      "BCMA")                                  ~ "Yes",
+    str_detect(
+      str_to_upper(eligible_cartitude1_reason), 
+      "TECLISTAMAB")                           ~ "Yes",
+    str_detect(
+      str_to_upper(eligible_cartitude1_reason), 
+      "TALQ")                                  ~ "Yes",
+    
+    is.na(txhistory_priorbmca_list)            ~ "No"
+  )) %>% 
+  # Lauren's updated code
+  mutate(priorBCMA = case_when( # used a combination of prior therapy, bcma list, and ineligible for cartitude1 reason
+    is.na(prior_other_therapy_yn) ~ NA_character_,
+    str_detect(patientid, "Roswell28") ~ "No",
+    str_detect(patientid, "12") & Site == "michigan"  ~ "No",
+    prior_other_therapy_yn == "Yes" & txhistory_priorbmca_list == "Talquetamab" ~ "No",
+    prior_other_therapy_yn == "Yes" & txhistory_priorbmca_list == "talq" ~ "No",
+    prior_other_therapy_yn == "Yes" ~ "Yes",
+    prior_other_therapy_yn == "No" & txhistory_priorbmca_list == "Teclistimab" ~ "Yes",
+    prior_other_therapy_yn == "No" & txhistory_priorbmca_list == "Teneo biospeficic (TENIO 383B)" ~ "Yes",
+    prior_other_therapy_yn == "No" ~ "No"
+  )) %>% 
+  # Fix bridging - no need anymore
+  # mutate(bridging_yn= case_when(
+  #   Site == "hackensack" & bridging_yn == "Yes" ~ "No",
+  #   Site == "hackensack" & bridging_yn == "No" ~ "Yes",
+  #   Site == "hackensack" & is.na(bridging_yn) ~ NA_character_,
+  #   Site == "fhcc" & bridging_yn == "Yes" ~ "No",
+  #   Site == "fhcc" & bridging_yn == "No" ~ "Yes",
+  #   Site == "fhcc" & is.na(bridging_yn) ~ NA_character_,
+  #   TRUE ~ bridging_yn
+  # )) %>% 
+  mutate(bridging_response_prbetter = case_when(
+    bridging_response == "Not Evaluable"       ~ NA_character_,
+    str_detect(bridging_response, "CR|PR")     ~ "PR or better",
+    bridging_yn == "No" & 
+      is.na(bridging_response)                 ~ "No bridging",
+    !is.na(bridging_response)                  ~ "< PR",
+    is.na(bridging_response)                   ~ NA_character_,
+    TRUE                                       ~ bridging_response
+  ), .after = bridging_response
+  ) %>% 
+  mutate(bridging_response_prbetter = factor(
+    bridging_response_prbetter, levels = c("No bridging", "< PR", "PR or better")
+  ))
+
+# DONE above
+  # mutate(bridging_response_cat = case_when(
+  #   bridging_yn == "No" & is.na(bridging_response) ~ "No bridging",
+  #   TRUE ~ bridging_response_cat
+  # )) %>% 
+  # mutate(bridging_response_cat_v2 = case_when(
+  #   bridging_yn == "No" & Site == "hackensack" ~ "No bridging",
+  #   bridging_yn == "No" & Site == "fhcc" ~ "No bridging",
+  #   bridging_yn == "No" & is.na(bridging_response) ~ "No bridging",
+  #   bridging_yn == "Yes" & is.na(bridging_response_cat) ~ "Bridging, unknown response",
+  #   TRUE ~ bridging_response_cat
+  # ))
+a <- data1 %>% select(patientid, Site, bridging_yn, bridging_response_prbetter, bridging_response)
+# Cilta_data_FHR$bridging_response_cat_v2 <- factor(Cilta_data_FHR$bridging_response_cat_v2, levels = c("No bridging", "PR or better", "PD/SD", "Bridging, unknown response"))
+ 
+
+ 
+
+  
+
+a <- data1 %>% select(patientid, prior_other_therapy_yn, txhistory_priorbmca_list, eligible_cartitude1_reason, prior_bcma_therapy)
+
+  # write_csv(data1 %>% select(txhistory_priorbmca_list) %>% filter(!is.na(txhistory_priorbmca_list)) %>%  distinct(), "List of BCMA drugs in the txhistory_priorbmca_list variable.csv")
+# write_csv(data1 %>% filter(prior_other_therapy_yn == "Yes" & is.na(txhistory_priorbmca_list)) %>% 
+#             select(patientid, Site, prior_other_therapy_yn, txhistory_priorbmca_list, eligible_cartitude1_reason), 
+#           "Patients with other therapies but not BCMA.csv")
+
+```
+
+```{r toxicities}
+data1 <- data1 %>% 
+  # CRS
+  # Remove NAs to duration and make as num
+  mutate(crs_duration_days = as.numeric(crs_duration_days)) %>% 
+  # Fix iec_hs_yn if updated_death_cause is HLH
+  mutate(iec_hs_yn = case_when(
+    # all HLH cause of death are not counted as iec, adding back
+    str_detect(updated_death_cause, "hlh")          ~ "Yes",
+    # not needed now but adding this line as warning for next update if it happens
+    str_detect(updated_death_cause, "iec")          ~ "Yes",
+    TRUE                                            ~ iec_hs_yn
+  )) %>% 
+  mutate(crs_outcome_detailled = case_when(
+         (max_crs_grd == 0 |
+            max_crs_grd == 1) &
+            (max_icans_grd == 0 &
+               iec_hs_yn == "No")                    ~ "Low - 1",
+         (max_crs_grd == 0 |
+            max_crs_grd == 1) &
+            (is.na(max_icans_grd) |
+               is.na(iec_hs_yn))                     ~ "no icans OR no iec data",
+         
+         (max_crs_grd == 0 |
+            max_crs_grd == 1) &
+            (max_icans_grd > 0 |
+               iec_hs_yn == "Yes")                   ~ "Severe - 0",
+         
+         # (max_crs_grd == 1 &
+         #   is.na(crs_duration_days)) &
+         #    (max_icans_grd > 0 &
+         #       iec_hs_yn == "Yes")                   ~ "Severe - 0",
+         
+         # (max_crs_grd == 1 &
+         #   is.na(crs_duration_days))                 ~ "CRS 1 but no duration",
+         
+         # (max_crs_grd == 1 &
+         #   crs_duration_days < 14) &
+         #    (max_icans_grd == 0 &
+         #       iec_hs_yn == "No")                    ~ "Low - 1",
+         
+         # (max_crs_grd == 1 &
+         #   crs_duration_days < 14) &
+         #    (is.na(max_icans_grd) |
+         #       is.na(iec_hs_yn))                     ~ "no icans OR no iec data",
+         
+         max_crs_grd %in% c(2:5)                     ~ "Severe - 0",
+         !is.na(max_crs_grd)                         ~ "check",
+         TRUE                                        ~ NA_character_
+       )) %>% 
+  mutate(crs_outcome = factor(crs_outcome_detailled, levels = c("Severe - 0", "Low - 1")))
+
+a <- data1 %>% select(patientid, max_crs_grd, crs_duration_days,crs_outcome, crs_outcome_detailled, max_icans_grd, iec_hs_yn, updated_death_cause)
+
+
+# cleaning delayed NT based on query responses from Surbhi
+# data1 <- data1 %>% 
+#   mutate(other_neurotox_yn = case_when(
+#    Site == "hackensack" & str_detect(patientid, "23") ~ "Yes",
+#    str_detect(patientid, "FH-C14") ~ "Yes",
+#    str_detect(patientid, "CCT5019-0857") ~ "Yes",
+#    Site == "hackensack" & str_detect(patientid, "21") ~ "Yes",
+#    Site == "hackensack" & str_detect(patientid, "66") ~ "Yes",
+#    Site == "hackensack" & str_detect(patientid, "27") ~ "Yes",
+#    str_detect(patientid, "FH-C6") ~ "Yes",
+#    Site == "hackensack" & str_detect(patientid, "70") ~ "Yes",
+#    Site == "hackensack" & str_detect(patientid, "34") ~ "Yes",
+#    Site == "hackensack" & str_detect(patientid, "10") ~ "No",
+#    str_detect(patientid, "KUMC_106") ~ "No",
+#    str_detect(patientid, "KUMC_121") ~ "No",
+#    str_detect(patientid, "CAR007") & Site == "columbia" ~ "No",
+#    str_detect(other_neurotox_list, "ATN") ~ "No",
+#    other_neurotox_list == "ICANS" ~ "No",
+#    other_neurotox_list == "Cognitive decline" ~ "No",
+#    other_neurotox_list == "pill rolling tremor 8/2" ~ "No",
+#    other_neurotox_list == "slowed cognition" ~ "No",
+#    TRUE ~ other_neurotox_yn
+# )) %>% 
+#   mutate(parkinson_neurotox_yn = case_when(
+#     other_neurotox_list == "Cognitive decline" ~ "Yes",
+#     other_neurotox_list == "pill rolling tremor 8/2" ~ "Yes",
+#     other_neurotox_list == "slowed cognition" ~ "Yes",
+#     TRUE ~ parkinson_neurotox_yn
+# )) %>% 
+#   mutate(other_neurotox_cat = case_when(
+#   is.na(other_neurotox_yn) ~ NA_character_,
+#   other_neurotox_yn == "Yes" & str_detect(other_neurotox_list, "alsy") ~ "Cranial nerve palsy",
+#   other_neurotox_yn == "Yes" & str_detect(other_neurotox_list, "droop") ~ "Cranial nerve palsy",
+#   other_neurotox_yn == "Yes" & str_detect(other_neurotox_list, "CN") ~ "Cranial nerve palsy",
+#   other_neurotox_yn == "Yes" ~ "Other",
+#   other_neurotox_yn == "No" ~ "No"
+# )) %>% 
+#   mutate(any_delay_neurotox_yn = case_when(
+#   is.na(parkinson_neurotox_yn) & is.na(other_neurotox_yn) ~ NA_character_,
+#   parkinson_neurotox_yn == "Yes" | other_neurotox_yn == "Yes" ~ "Yes",
+#   TRUE ~ "No"
+# ))
+```
+
+```{r disease}
+data2 <- data1 %>%
+# Myeloma
+  mutate(oligo_nonsecretory_chris = case_when(
+    oligo_nonsecretory == "Non-secretory"        ~ "Yes",
+    oligo_nonsecretory == "Oligosecretory"       ~ "Yes",
+    TRUE                                             ~ oligo_nonsecretory
+  ))
+```
+
+```{r baseline}
+data2 <- data2 %>%
+#   mutate(labs_platelets_preld = 
+#            as.numeric(str_extract_all(labs_platelets_preld, "[[:digit:]]+"))
+#   )  %>% 
+  mutate(ferritin_per200 = labs_bsln_ferritin / 200)
+```
+
+```{r EMD}
+cilta <- data2 %>% 
+  mutate(true_emd = case_when(
+    extramedu_yn == "Yes" & 
+      medhx_paraskeletal_yn == "No"              ~ "Yes", 
+    extramedu_yn == "Yes" & 
+      medhx_paraskeletal_yn == "Yes"             ~ "No",
+    extramedu_yn == "No"                         ~ "No", 
+    is.na(medhx_paraskeletal_yn)                 ~ NA_character_,
+    TRUE                                         ~ "check"
+  ))
+a <- cilta %>% select(patientid, extramedu_yn, medhx_paraskeletal_yn, true_emd)
+```
+
+```{r Labeling}
+# Labeling ----
+var_label(cilta) <- list(age_cart = "Patient age", agecat = "Patient age - Categories",
+                         male_sex = "Male Sex", sex = "Sex",
+                         race_eth = "Race and ethnicity",
+                         mo_os_from_infusion = "Follow-up time from infusion (months)",
+                         extramedu_yn = "Extramedullary disease",
+                         medhx_amyloid_yn = "Amyloidosis",
+                         medhx_pcl_yn = "Plasma cell leukemia",
+                         # circulating_plasma_cell = "UPDATED Circulating Plasma Cells",
+                         bsln_burden_ge50pct = "High marrow burden (≥50%)",
+                         ecog_ld = "ECOG at LD",
+                         # `ECOG > or = 2? (Yes, No)` ,
+                         r_iss = "R-ISS at cart infusion",
+                         cytogenetics = "High risk cytogenetics (not include gain 1q)",
+                         deletion_17p_tp53 = "Deletion 17p at Infusion",
+                         t_414_yn = "t(4:14) at Infusion",
+                         t_1416_yn = "t(4:16) at Infusion",
+                         copyalteration_1q21 = "Gain/amp 1q21",
+                         # number_of_prior_lines_of_therapy = "Number of prior lines of therapy",
+                         # number_prior_lines_therapy = "Number of prior lines of therapy (cat)",
+                         prior_other_therapy_yn = "Prior other therapy",
+                         bridging_yn = "Bridging therapy",
+                         bridging_response = "Bridging response (detailled)",
+                         bridging_response_prbetter = "Bridging response (PR or better)",
+                         prior_auto_sct_yn = "Prior autoSCT",
+                         prior_allo_sct_yn = "Prior alloSCT",
+                         prior_tx_cat = "Number of prior regimens (cat)",
+                         
+                         condition_therapy = "Lymphodepletion chemotherapy",
+                         priorBCMA = "Prior BCMA-directed therapy",
+                         # need_for_g_csf_post_infus_yes_1_no_0 = "Granulocyte colony stimulating factor (G-CSF)",
+                         # need_for_ivig_yes_1_no_0 = "Intravenous immunoglobulin (IVIG)",
+                         # cd34_stem_cell_boost_yes_1_no_0 = "CD34 stem cell boost",
+                         # tpo_agonist_post_cart_yes_1_no_0 = "Thrombopoietin (TPO) agonist",
+                         # bmicat = "BMI at apheresis - Normal, Overweight, Obese",
+                         # steroid_use_yes_no = "Steroid Use", tocilizumab_yes_no = "Tocilizumab Use",
+                         # anakinra_yes_no = "Anakinra Use",
+                         proteasome = "Refractory to Proteasome Inhibitors",
+                         # lenalidomide_exposed_vs_refractory_vs_not_exposed = "Refractory to Lenalidomide",
+                         # bortezomib_exposed_vs_refractory_vs_not_exposed = "Refractory to Bortezomib",
+                         # carfilzomib_exposed_vs_refractory_vs_not_exposed = "Refractory to Carfilzomib",
+                         # pomalidomide_exposed_vs_refractory_vs_not_exposed = "Refractory to Pomalidomide",
+                         dara = "Refractory to Daratumumab or Isatuximab",
+                         immuno = "Refractory to Immunomodulators", doubleref = "Double refractory",
+                         tripleref= "Triple refractory", pentaref= "Penta refractory",
+                         # bmicat2 = "BMI at apheresis - Normal vs. Overweight/Obese",
+                         CRS_any = "Any CRS", CRS_gradecat = "CRS Grade",
+                         ICANS_any = "Any ICANS", ICANS_gradecat = "ICANS Grade",
+                         # day_of_onset_crs_relative_to_infusion = "Day of onset of CRS relative to infusion",
+                         # day_of_max_crs_relative_to_infusion = "Day of Max CRS (relative to infusion)",
+                         crs_duration_days = "Duration of CRS (days)",
+                         # day_of_onset_icans_relative_to_infusion = "Day of onset of ICANS relative to infusion",
+                         # day_of_max_icans_relative_to_infusion = "Day of Max ICANS (relative to infusion)",
+                         icans_duration_days = "Duration of ICANS (days)",
+                         # delayed_neuro = "Delayed Neurotoxicity",
+                         # parkinsonian_neurotoxicity_yes_no = "Parkinsonian Neurotoxicity",
+                         # other_delayed_non_parkinsonian_neurologic_toxicity_yes_no =
+                         #   "Other/Delayed Non-Parkinsonian Neurologic Toxicity",
+                         # delayed_neuro_type = "Delayed Neurotoxicity Type",
+                         iec_hs_yn = "IEC-HS",
+                         
+                         ferritin_per200 = "Baseline Ferritin (scaled back 200)",
+
+                         cart_infusion_days_from_aph = "Time from apheresis to CAR-T infusion (days)",
+                         # total_dose_volume_m_l = "Total dose volume (mL)",
+                         cart_infusion_dose = "Total cell dose (million cells)",
+                         cart_cell_dose_cat = "Total cell dose (cat)",
+                         # best_ORRcollapsed = "Best ORR at ≤ 12 months",
+
+
+                         eligible_cartitude1 =
+                           "Did patient meet cartitude criteria"#,
+                         # best_response = "Best response in first 90 days"
+)
+
+```
+<br>
+
+# Exploratory analysis
+
+```{r infused}
+a <- data1 %>% 
+  mutate(has_infusion_date = case_when(
+    !is.na(cart_infusion_dt)          ~ "Yes",
+    is.na(cart_infusion_dt)           ~ "No"
+  )) %>% 
+  select(patientid, infused_status, has_infusion_date, cart_infusion_days_from_aph)
+
+cilta %>% 
+  distinct(patientid, .keep_all = TRUE) %>% 
+  # mutate(has_infusion_date = case_when(
+  #   !is.na(cart_infusion_dt)          ~ "Yes",
+  #   is.na(cart_infusion_dt)           ~ "No"
+  # )) %>% 
+  select(infused_status) %>% 
+  tbl_summary(missing = "no") %>% 
+  bold_labels() %>% add_stat_label()
+```
+
+
+```{r limit to infused patient, echo = TRUE, class.source= 'fold-hide'}
+cilta <- cilta %>% 
+  filter(infused_status == "Infused")
+```
+
+## We included `r nrow(cilta)` infused patients
+
+
+Verify CRS outcome classification
+```{r}
+cilta %>% 
+  distinct(patientid, .keep_all = TRUE) %>% 
+  select(max_crs_grd, 
+         crs_duration_days, crs_outcome, 
+         crs_outcome_detailled, max_icans_grd, 
+         iec_hs_yn, updated_death_cause) %>% 
+  tbl_summary(by = crs_outcome_detailled,
+              statistic=list(all_continuous() ~ "{median} ({min}, {max})")) %>% 
+  bold_labels()
+```
+
+Verify True EMD
+```{r}
+cilta %>% 
+  select(true_emd,
+         extramedu_yn, medhx_paraskeletal_yn) %>% 
+  mutate(true_emd = fct_explicit_na(true_emd)) %>% 
+  tbl_summary(by = true_emd,
+              type = list(all_dichotomous() ~ "categorical"),
+              missing_text = "Unknown") %>% 
+  bold_labels() %>% 
+  modify_spanning_header(all_stat_cols() ~ "true_emd")
+
+cilta %>% 
+  select(true_emd,
+         extramedu_yn, medhx_paraskeletal_yn) %>% 
+  mutate(extramedu_yn = fct_explicit_na(extramedu_yn)) %>% 
+  tbl_summary(by = extramedu_yn,
+              type = list(all_dichotomous() ~ "categorical"),
+              missing_text = "Unknown") %>% 
+  bold_labels() %>% 
+  modify_spanning_header(all_stat_cols() ~ "extramedu_yn")
+```
+2 missing Extramedullary disease coded as missing for True EMD. 1 Yes Extramedullary disease is unknown for paraskeletal so coded as missing for True EMD.
+
+
+## Patient characteristics for the full dataset
+```{r look at patient characteristics}
+a <- cilta %>% select(patientid, bsln_bmpc, bsln_burden_ge50pct, bmpc_cat)
+cilta %>% 
+  distinct(patientid, .keep_all = TRUE) %>% 
+  select(mo_os_from_infusion, 
+         age_cart, agecat, male_sex, sex, 
+         race_eth,
+         ecog_apheresis, ecog_apheresis_cat, 
+         ecog_ld, ecog_at_ld_cat, ecog_ge_2,
+         subtype, r_iss,
+         true_emd,
+         extramedu_yn, medhx_paraskeletal_yn,
+         
+         bsln_bmpc, bsln_burden_ge50pct, bmpc_cat,
+         cytogenetics, 
+         deletion_17p_tp53, t_414_yn, t_1416_yn, 
+         copyalteration_1q21, deletion_1p32,
+         priorBCMA, 
+         txhistory_priorbmca_list, 
+         bridging_yn,
+         bridging_response, bridging_response_prbetter,
+         prior_tx_lines, priortx_grp, prior_tx_cat,
+         prior_other_therapy_yn,
+         immuno, proteasome, dara, doubleref, tripleref, pentaref, 
+         condition_therapy,
+         prior_auto_sct_yn, prior_allo_sct_yn,
+         labs_bsln_crp, 
+         labs_bsln_ferritin, ferritin_per200,
+         medhx_amyloid_yn, medhx_pcl_yn,
+         cart_infusion_dose, cart_cell_dose_cat, 
+         eligible_cartitude1,
+         
+         
+         max_crs_grd,
+         crs_duration_days, 
+         max_icans_grd,
+         iec_hs_yn
+         ) %>% 
+  tbl_summary(
+    type = list(
+      c(ecog_ge_2, bsln_burden_ge50pct,
+        true_emd,
+        extramedu_yn, medhx_paraskeletal_yn,
+        cytogenetics,
+        deletion_17p_tp53,
+        t_414_yn,
+        t_1416_yn, copyalteration_1q21,
+        bridging_yn,
+        priorBCMA, prior_other_therapy_yn,
+        immuno, proteasome, dara, doubleref, tripleref, pentaref,
+        medhx_amyloid_yn, medhx_pcl_yn,
+        eligible_cartitude1,
+
+        iec_hs_yn
+        )
+      ~"categorical"),
+    statistic = list(all_continuous() ~ "{median} ({min}, {max})"), 
+    digits = all_continuous() ~ 1
+  ) %>% 
+  bold_labels() %>% add_stat_label() %>% 
+  remove_footnote_header(columns = everything())
+```
+
+
+
+# Predictive modeling
+
+* Variables to consider:    
+  + Age (age_cart)
+  + Sex (sex)
+  + Race and ethnicity (race_eth)
+  + ECOG PS (ecog_ld, ecog_apheresis)
+  + Myeloma subtype (subtype)
+  + R-ISS disease stage (r_iss)
+  + True EMD (extramed_yn)
+  + Marrow burden – bone marrow plasma cell % (analyze both continuous and categorical - bsln_bmpc, bmpc_cat)
+  + High-risk cytogenetics (any one of the del17p, t_414, t_1416 present, if missing some but no for others then = no, if missing all then missing)
+  + Bridging therapy + response to bridging therapy (bridging_yn, bridging_therapy, bridging_response)
+  + Penta-refractory status (pentaref)
+  + Number of prior lines of therapy (prior_tx_lines, priortx_grp – may need to collapse groups if “1-3” doesn’t have many patients in one of the outcome groups).
+  + Prior anti-BCMA therapy (prior_other_therapy_yn, txhistory_priorbmca_list)
+  + Lymphodepletion chemotherapy (condition_therapy)
+  + Baseline CRP (labs_bsln_crp)
+  + Baseline ferritin (labs_bsln_ferritin), ferritin_per200??????
+  + Amyloidosis (medhx_amyloid_yn)
+  + Plasma cell leukemia (medhx_pcl_yn)
+
+```{r remove NA in outcome, echo = TRUE, class.source= 'fold-hide'}
+cilta <- cilta %>% 
+  filter(!is.na(crs_outcome))
+```
+
+#### We included `r nrow(cilta)` infused patients with CRS outcome
+
+```{r training testing sets, echo = TRUE, class.source= 'fold-hide'}
+set.seed(1234)
+# Train/test split balanced for multiple factors
+balance <- c("crs_outcome", "subtype", "r_iss", "age_cart", "bridging_response_prbetter")
+data_split_term <- multi_strata(cilta[ ,balance], strategy= "interaction") 
+
+index.split <- splitTools::partition(data_split_term, p = c(train=0.8, test=0.2))
+training_set <- cilta[index.split$train, ]
+testing_set <- cilta[index.split$test, ]
+```
+
+#### `r nrow(training_set)` are include in the training set while `r nrow(testing_set)` are include in the testing set.    
+Both data still contains missing data.
+
+
+## Training and testing comparison table
+```{r select var, echo = TRUE, class.source= 'fold-hide'}
+step_reg_data <- training_set %>% 
+  select(age_cart, sex, 
+         race_eth,
+         # ecog_apheresis, ecog_apheresis_cat, 
+         # ecog_ld, 
+         ecog_at_ld_cat,
+         ecog_ge_2,
+         subtype, r_iss,
+         true_emd,
+         
+         bsln_bmpc, bmpc_cat,
+         cytogenetics, bsln_b2m_value,
+         bridging_yn, bridging_response, bridging_response_prbetter,
+         pentaref, 
+         prior_tx_lines, prior_tx_cat,
+         
+         priorBCMA,
+         txhistory_priorbmca_list, 
+         prior_other_therapy_yn,
+         condition_therapy,
+         labs_bsln_crp, 
+         labs_bsln_ferritin, ferritin_per200,
+         medhx_amyloid_yn, medhx_pcl_yn,
+         cart_cell_dose_cat, 
+         eligible_cartitude1, crs_outcome)
+
+testing_set_limited_var <- testing_set %>% 
+  select(age_cart, sex, 
+         race_eth,
+         ecog_at_ld_cat,
+         ecog_ge_2,
+         subtype, r_iss,
+         true_emd,
+         
+         bsln_bmpc, bmpc_cat,
+         cytogenetics, 
+         bridging_yn, bridging_response, bridging_response_prbetter,
+         pentaref, 
+         prior_tx_lines, prior_tx_cat,
+         
+         priorBCMA,
+         txhistory_priorbmca_list, 
+         prior_other_therapy_yn,
+         condition_therapy,
+         labs_bsln_crp, 
+         labs_bsln_ferritin, ferritin_per200,
+         medhx_amyloid_yn, medhx_pcl_yn,
+         cart_cell_dose_cat, 
+         eligible_cartitude1, crs_outcome)
+```
+
+```{r training and testing table}
+step_reg_data %>% 
+  mutate(data = "Training") %>% 
+  bind_rows(., testing_set_limited_var %>% 
+  mutate(data = "Testing")) %>% 
+  tbl_summary(by = data,
+              type = list(all_dichotomous() ~ "categorical")) %>% 
+  bold_labels() %>% 
+  add_p() %>% bold_p(t = 0.05) %>% 
+  add_overall() %>% 
+  add_stat_label() %>% 
+  remove_footnote_header(columns = everything())
+```
+
+
+## Look at missingness in the training dataset
+```{r}
+skimr::skim(step_reg_data)
+```
+
+```{r, echo = TRUE, class.source= 'fold-hide'}
+step_reg_data <- step_reg_data %>% 
+  select(-c(txhistory_priorbmca_list))
+```
+At this step and hereafter,    
+- I excluded `txhistory_priorbmca_list` as I and Lauren used it to code `priorBCMA`.   
+
+```{r}
+library(naniar)
+
+vis_miss(step_reg_data)
+gg_miss_upset(step_reg_data, nsets = 15)
+
+gg_miss_fct(x = step_reg_data, fct = crs_outcome)
+```
+`R-ISS` and `bsln_b2m_value` has a high rate of missingness.
+
+
+# Univariate logistic regression for each predictor
+```{r prelim logit, echo = TRUE, class.source= 'fold-hide'}
+step_reg_data <- step_reg_data %>% 
+  mutate(crs_outcome_glm = case_when(
+    crs_outcome == "Severe - 0"      ~ "0",
+    crs_outcome == "Low - 1"         ~ "1"
+  ), crs_outcome_glm = factor(crs_outcome_glm, levels = c("0", "1"))) %>% 
+  select(-crs_outcome)
+
+tbl_uvregression(
+  step_reg_data,
+  method = glm,
+  y = crs_outcome_glm,
+  method.args = list(family = binomial),
+  exponentiate = TRUE,
+  # include = -c("patientid"),
+  pvalue_fun = label_style_pvalue(digits = 2)
+  ) %>%
+  bold_p(t = .05) %>%
+  add_nevent(location = "level") %>% add_n(location = "level") %>%
+  bold_labels() %>% italicize_levels()
+```
+The next step is to apply a stepwise regression.   
+
+Brett ->	Limit potential predictors to those with univariate p-value < 0.15 and missingness < 20%.   
+Brett ->	Stepwise regression is done on categorical variables only
+
+
+# Stepwise Regression
+
+Following the above rule, these variables are excluded from the stepwise regression :    
+
+age_cart    
+Sex    
+Race and ethnicity   
+True EMD    
+High risk cytogenetics   
+Bridging response (detailled)    
+Number of prior regimens    
+Number of prior regimens (cat)    
+Prior BCMA-directed therapy    
+Prior other therapy    
+Lymphodepletion chemotherapy    
+Amyloidosis    
+Total cell dose (cat)    
+Did patient meet cartitude criteria    
+
+Variables included:   
+ecog_at_ld_cat   
+ecog_ge_2 (removed as is redundant)    
+subtype    
+R-ISS at cart infusion (include cytogenetics and bsln_b2m_value instead)    
+bsln_bmpc   
+bmpc_cat (only include the continuous)   
+Bridging therapy (removed as is redundant)       
+Bridging response (PR or better)    
+Penta refractory    
+Baseline Ferritin   
+Plasma cell leukemia    
+
+Note:    
+Include `cytogenetics` instead of R-ISS but `bsln_b2m_value` has too much missing so is excluded.   
+
+## Impute
+- missing ecog_at_ld_cat are attributed to "0-1" cat.   
+- missing cytogenetics are attributed to "Unknown".   
+- missing bridging_response_prbetter are attributed to "Unknown".   
+- missing bmpc_cat are attributed to "Unknown".   
+- subtype are attributed to "Intact immunoglobulin".   
+- medhx_pcl_yn are attributed to "No".   
+
+```{r remove excluded var with higher p val, echo = TRUE, class.source= 'fold-hide'}
+cilta_ferritin_mean <- mean(cilta$labs_bsln_ferritin, na.rm = TRUE) # = 531.4773 
+
+step_reg_data_imputed <- step_reg_data %>% 
+  select(-c(age_cart, sex, race_eth, 
+            ecog_ge_2, true_emd,
+            r_iss, bsln_bmpc, #bmpc_cat,
+            bsln_b2m_value,
+            bridging_yn,
+            bridging_response,
+            prior_tx_lines, prior_tx_cat,
+            priorBCMA,
+            prior_other_therapy_yn, condition_therapy,
+            labs_bsln_crp, 
+            ferritin_per200,
+            medhx_amyloid_yn, 
+            cart_cell_dose_cat, eligible_cartitude1)) %>% 
+  mutate(ecog_at_ld_cat = case_when(
+    is.na(ecog_at_ld_cat)              ~ "0-1", # 13 missing
+    TRUE                               ~ ecog_at_ld_cat
+  )) %>% 
+  mutate(cytogenetics = case_when(
+    is.na(cytogenetics)                ~ "Unknown", # 75 missing
+    TRUE                               ~ cytogenetics
+  )) %>% 
+  mutate(bridging_response_prbetter = case_when(
+    is.na(bridging_response_prbetter)  ~ "Unknown", # 48 missing
+    TRUE                               ~ bridging_response_prbetter
+  )) %>% 
+  mutate(bmpc_cat = case_when(
+    is.na(bmpc_cat)                    ~ "Unknown", # 102
+    TRUE                               ~ bmpc_cat
+  )) %>% 
+  mutate(subtype = case_when(
+    is.na(subtype)                    ~ "Intact immunoglobulin (heavy+light chain)", # 1
+    TRUE                               ~ subtype
+  )) %>% 
+  mutate(medhx_pcl_yn = case_when(
+    is.na(medhx_pcl_yn)                ~ "No", # 1
+    TRUE                               ~ medhx_pcl_yn
+  )) #%>% 
+  # Forcing the unknown into R-ISS
+  # mutate(r_iss = case_when(
+  #   is.na(r_iss)                     ~ "Unknown",
+  #   TRUE                             ~ r_iss
+  # )) %>% 
+
+step_reg_data_no_missing <- step_reg_data_imputed %>% 
+  mutate(labs_bsln_ferritin = case_when(
+    is.na(labs_bsln_ferritin)          ~ cilta_ferritin_mean, # 83
+    TRUE                               ~ labs_bsln_ferritin
+  )) %>% 
+  drop_na()
+
+step_reg_data_ferr_missing <- step_reg_data_imputed %>% 
+  drop_na()
+
+
+training_set_imputed <- training_set %>% 
+  mutate(crs_outcome_glm = case_when(
+    crs_outcome == "Severe - 0"      ~ "0",
+    crs_outcome == "Low - 1"         ~ "1"
+  ), crs_outcome_glm = factor(crs_outcome_glm, levels = c("0", "1"))) %>% 
+  select(age_cart, sex, 
+         race_eth,
+         ecog_at_ld_cat,
+         ecog_ge_2,
+         subtype, r_iss,
+         true_emd,
+         
+         bsln_bmpc, bmpc_cat,
+         cytogenetics, 
+         bridging_yn, bridging_response, bridging_response_prbetter,
+         pentaref, 
+         prior_tx_lines, prior_tx_cat,
+         
+         priorBCMA,
+         txhistory_priorbmca_list, 
+         prior_other_therapy_yn,
+         condition_therapy,
+         labs_bsln_crp, 
+         labs_bsln_ferritin, ferritin_per200,
+         medhx_amyloid_yn, medhx_pcl_yn,
+         cart_cell_dose_cat, 
+         eligible_cartitude1, 
+         crs_outcome, crs_outcome_glm,
+         -c(age_cart, sex, race_eth, 
+            ecog_ge_2, true_emd,
+            txhistory_priorbmca_list,
+            r_iss, bsln_bmpc, #bmpc_cat,
+            bsln_b2m_value,
+            bridging_yn,
+            bridging_response,
+            prior_tx_lines, prior_tx_cat,
+            priorBCMA,
+            prior_other_therapy_yn, condition_therapy,
+            labs_bsln_crp, 
+            ferritin_per200,
+            medhx_amyloid_yn, 
+            cart_cell_dose_cat, eligible_cartitude1, crs_outcome)) %>% 
+  mutate(ecog_at_ld_cat = case_when(
+    is.na(ecog_at_ld_cat)              ~ "0-1", # 13 missing
+    TRUE                               ~ ecog_at_ld_cat
+  )) %>% 
+  mutate(cytogenetics = case_when(
+    is.na(cytogenetics)                ~ "Unknown", 
+    TRUE                               ~ cytogenetics
+  )) %>% 
+  mutate(bridging_response_prbetter = case_when(
+    is.na(bridging_response_prbetter)  ~ "Unknown", 
+    TRUE                               ~ bridging_response_prbetter
+  )) %>% 
+  mutate(bmpc_cat = case_when(
+    is.na(bmpc_cat)                    ~ "Unknown", 
+    TRUE                               ~ bmpc_cat
+  )) %>% 
+  mutate(subtype = case_when(
+    is.na(subtype)                    ~ "Intact immunoglobulin (heavy+light chain)", 
+    TRUE                               ~ subtype
+  )) %>% 
+  mutate(medhx_pcl_yn = case_when(
+    is.na(medhx_pcl_yn)                ~ "No",
+    TRUE                               ~ medhx_pcl_yn
+  )) %>% 
+  mutate(labs_bsln_ferritin = case_when(
+    is.na(labs_bsln_ferritin)          ~ cilta_ferritin_mean,
+    TRUE                               ~ labs_bsln_ferritin
+  )) %>% 
+  drop_na()
+
+step_reg_data_complete_case <- step_reg_data %>% 
+  select(-c(age_cart, sex, race_eth, 
+            ecog_ge_2, true_emd,
+            r_iss, bsln_bmpc, #bmpc_cat,
+            bsln_b2m_value,
+            bridging_yn,
+            bridging_response,
+            prior_tx_lines, prior_tx_cat,
+            priorBCMA,
+            prior_other_therapy_yn, condition_therapy,
+            labs_bsln_crp, 
+            ferritin_per200,
+            medhx_amyloid_yn, 
+            cart_cell_dose_cat, eligible_cartitude1)) %>% 
+  drop_na()
+```
+
+Verification of the imputation
+```{r vrification imputation, echo = TRUE, class.source= 'fold-hide'}
+step_reg_data_ferr_missing %>% 
+  tbl_summary(type = list(all_dichotomous() ~ "categorical")) %>% 
+  bold_labels() %>% 
+  modify_spanning_header(all_stat_cols() ~ "Stepreg data with missing ferritin")
+step_reg_data_no_missing %>% 
+  tbl_summary(type = list(all_dichotomous() ~ "categorical")) %>% 
+  bold_labels() %>% 
+  modify_spanning_header(all_stat_cols() ~ "Stepreg data with NO missing")
+```
+
+
+```{r, echo = TRUE, class.source= 'fold-hide'}
+# Do the same outcome coding for the main data but keeping all var
+cilta <- cilta %>% 
+  # mutate(r_iss = case_when(
+  #   is.na(r_iss)                     ~ "Unknown",
+  #   TRUE                             ~ r_iss
+  # )) %>% 
+  mutate(crs_outcome_glm = case_when(
+    crs_outcome == "Severe - 0"      ~ "0",
+    crs_outcome == "Low - 1"         ~ "1"
+  ), crs_outcome_glm = factor(crs_outcome_glm, levels = c("0", "1")))
+
+training_set <- training_set %>% 
+  # mutate(r_iss = case_when(
+  #   is.na(r_iss)                     ~ "Unknown",
+  #   TRUE                             ~ r_iss
+  # )) %>% 
+  mutate(crs_outcome_glm = case_when(
+    crs_outcome == "Severe - 0"      ~ "0",
+    crs_outcome == "Low - 1"         ~ "1"
+  ), crs_outcome_glm = factor(crs_outcome_glm, levels = c("0", "1")))
+
+testing_set <- testing_set %>% 
+  # mutate(r_iss = case_when(
+  #   is.na(r_iss)                     ~ "Unknown",
+  #   TRUE                             ~ r_iss
+  # )) %>% 
+  mutate(crs_outcome_glm = case_when(
+    crs_outcome == "Severe - 0"      ~ "0",
+    crs_outcome == "Low - 1"         ~ "1"
+  ), crs_outcome_glm = factor(crs_outcome_glm, levels = c("0", "1")))
+```
+
+## Actual stepwise regression / excluding patients with missing values for ferritin
+<!-- AIC: AIC works by penalizing the inclusion of additional variables in a model. The lower the AIC, the better performance of the model. AIC does not include sample size in penalty calculation, and it is optimal in minimizing the mean square error of predictions -->
+```{r stepreg, fig.height=9, echo = TRUE, class.source= 'fold-hide'}
+formula <- crs_outcome_glm ~ .
+set.seed(1234)
+res <-
+  stepwise(formula = formula,
+           data = step_reg_data_ferr_missing,
+           type = "logit",
+           # include = "pentaref",
+           strategy = "bidirection",
+           metric = c("AIC"))
+res
+summary(res$bidirection$AIC)
+
+plot_list <- setNames(
+  lapply(c("bidirection"),function(i){
+    setNames(
+      lapply(c("details","overview"),function(j){
+        plot(res,strategy=i,process=j)
+    }),
+    c("details","overview")
+    )
+  }),
+  c("bidirection")
+)
+
+cowplot::plot_grid(plotlist = plot_list$bidirection, ncol = 1, rel_heights = c(2, 1))
+
+# report(res, report_name = paste0(here::here(), "/Rmd/stepwise_report_ferr_missing", today()), format = "html")
+```
+
+
+Using the `r res[["voted_model"]][["strategy:metric"]]` strategy, the voted model is   
+`r res[["voted_model"]][["model"]]`.   
+
+## Actual stepwise regression / all imputed / including all patients
+<!-- AIC: AIC works by penalizing the inclusion of additional variables in a model. The lower the AIC, the better performance of the model. AIC does not include sample size in penalty calculation, and it is optimal in minimizing the mean square error of predictions -->
+```{r stepreg no missing, fig.height=9, echo = TRUE, class.source= 'fold-hide'}
+formula <- crs_outcome_glm ~ .
+set.seed(1234)
+res_no_missing <-
+  stepwise(formula = formula,
+           data = step_reg_data_no_missing,
+           type = "logit",
+           # include = "pentaref",
+           strategy = "bidirection",
+           metric = c("AIC"))
+res_no_missing
+summary(res_no_missing$bidirection$AIC)
+
+plot_list <- setNames(
+  lapply(c("bidirection"),function(i){
+    setNames(
+      lapply(c("details","overview"),function(j){
+        plot(res_no_missing,strategy=i,process=j)
+    }),
+    c("details","overview")
+    )
+  }),
+  c("bidirection")
+)
+
+cowplot::plot_grid(plotlist = plot_list$bidirection, ncol = 1, rel_heights = c(2, 1))
+
+# report(res_no_missing, report_name = paste0(here::here(), "/Rmd/stepwise_report_no_missing", today()), format = "html")
+```
+Using the `r res_no_missing[["voted_model"]][["strategy:metric"]]` strategy, the voted model is   
+`r res_no_missing[["voted_model"]][["model"]]`.   
+
+## Actual stepwise regression / complete case
+<!-- AIC: AIC works by penalizing the inclusion of additional variables in a model. The lower the AIC, the better performance of the model. AIC does not include sample size in penalty calculation, and it is optimal in minimizing the mean square error of predictions -->
+```{r stepreg complete case, fig.height=9, echo = TRUE, class.source= 'fold-hide'}
+formula <- crs_outcome_glm ~ .
+set.seed(1234)
+res_complete_case <-
+  stepwise(formula = formula,
+           data = step_reg_data_complete_case,
+           type = "logit",
+           # include = "pentaref",
+           strategy = "bidirection",
+           metric = c("AIC"))
+res_complete_case
+summary(res_complete_case$bidirection$AIC)
+
+plot_list <- setNames(
+  lapply(c("bidirection"),function(i){
+    setNames(
+      lapply(c("details","overview"),function(j){
+        plot(res_complete_case,strategy=i,process=j)
+    }),
+    c("details","overview")
+    )
+  }),
+  c("bidirection")
+)
+
+cowplot::plot_grid(plotlist = plot_list$bidirection, ncol = 1, rel_heights = c(2, 1))
+
+report(res_complete_case, report_name = paste0(here::here(), "/Rmd/stepwise_report_no_missing", today()), format = "html")
+```
+Using the `r res_complete_case[["voted_model"]][["strategy:metric"]]` strategy, the voted model is   
+`r res_complete_case[["voted_model"]][["model"]]`.   
+
+
+# Population description
+
+## Table 1. Patient characteristics (overall population considered)
+```{r Table Patient characteristics}
+cilta %>% 
+  select(mo_os_from_infusion, 
+         age_cart, agecat, male_sex, sex, 
+         race_eth,
+         ecog_apheresis, ecog_apheresis_cat,
+         ecog_ld, ecog_at_ld_cat, ecog_ge_2,
+         subtype, r_iss,
+         true_emd,
+         extramedu_yn, medhx_paraskeletal_yn,
+         
+         bsln_bmpc, bmpc_cat,
+         cytogenetics, 
+         deletion_17p_tp53, t_414_yn, t_1416_yn, 
+         copyalteration_1q21, deletion_1p32,
+         priorBCMA, txhistory_priorbmca_list, 
+         bridging_yn, 
+         bridging_response, 
+         prior_tx_lines, priortx_grp, prior_other_therapy_yn,
+         immuno, proteasome, dara, doubleref, tripleref, pentaref, 
+         condition_therapy,
+         # prior_auto_sct_yn, prior_allo_sct_yn,
+         labs_bsln_crp, labs_bsln_ferritin,
+         medhx_amyloid_yn, medhx_pcl_yn,
+         cart_infusion_dose, cart_cell_dose_cat, 
+         eligible_cartitude1, 
+         crs_outcome_glm, crs_outcome
+         ) %>% 
+  tbl_summary(by = crs_outcome,
+    type = list(
+      c(ecog_ge_2,
+        true_emd,
+        cytogenetics,
+        deletion_17p_tp53,
+        t_414_yn,
+        t_1416_yn, copyalteration_1q21,
+        bridging_yn,
+        priorBCMA,
+        immuno, proteasome, dara, doubleref, tripleref, pentaref,
+        medhx_amyloid_yn, medhx_pcl_yn,
+        eligible_cartitude1
+        )
+      ~"categorical"),
+    statistic = list(all_continuous() ~ "{median} ({min}, {max})"), 
+    digits = all_continuous() ~ 1
+  ) %>% 
+  bold_labels() %>% 
+  add_p() %>% bold_p(t = 0.05) %>% 
+  add_overall() %>% 
+  add_stat_label() %>% 
+  modify_spanning_header(all_stat_cols() ~ "CRS outcome") %>% 
+  remove_footnote_header(columns = everything())
+```
+
+## Table 2. Clinical outcomes
+```{r Table Clinical outcomes}
+cilta %>% 
+  select(max_crs_grd,
+         crs_duration_days, 
+         max_icans_grd,
+         iec_hs_yn,
+         other_neurotox_yn, parkinson_neurotox_yn, 
+         other_neurotox_cat, any_delay_neurotox_yn,
+         nrm, nrm_grp,
+         crs_outcome
+         ) %>% 
+  tbl_summary(by = crs_outcome,
+    type = list(
+      c(all_dichotomous()
+        )
+      ~"categorical"),
+    statistic = list(all_continuous() ~ "{median} ({min}, {max})"), 
+    digits = all_continuous() ~ 1
+  ) %>% 
+  bold_labels() %>% 
+  add_p() %>% bold_p(t = 0.05) %>% 
+  add_overall() %>% 
+  add_stat_label() %>% 
+  modify_spanning_header(all_stat_cols() ~ "CRS outcome") %>% 
+  remove_footnote_header(columns = everything())
+```
+
+## Table 3. Responses
+```{r Table Responses}
+cilta %>% 
+  select(day30_response, day30response, day30response_v2, day30response_MRD, 
+         mon3_response, mon3response, mon3response_v2, mon3response_MRD, 
+         mon6_response, mon6response, mon6response_v2, mon6response_MRD, 
+         mon9_response, mon9response, mon9response_v2, mon9response_MRD, 
+         mon12_response, mon12response, mon12response_v2, mon12response_MRD,
+         best_response, best_response_MRD,
+         best_ORR, best_CRorbetter,
+         crs_outcome
+         ) %>% 
+  tbl_summary(by = crs_outcome,
+    type = list(
+      c(all_dichotomous()
+        )
+      ~"categorical"),
+    statistic = list(all_continuous() ~ "{median} ({min}, {max})"), 
+    digits = all_continuous() ~ 1
+  ) %>% 
+  bold_labels() %>% 
+  add_p() %>% bold_p(t = 0.05) %>% 
+  add_overall() %>% 
+  add_stat_label() %>% 
+  modify_spanning_header(all_stat_cols() ~ "Responses") %>% 
+  remove_footnote_header(columns = everything())
+```
+
+## Survival
+### OS
+Median OS
+```{r}
+survfit(Surv(mo_os_from_infusion, os_event) ~ 1, data = cilta)
+survfit(Surv(mo_os_from_infusion, os_event) ~ crs_outcome, data = cilta)
+```
+
+
+```{r Survival analysis - KM by crs_outcome}
+ggsurvplot(survfit(Surv(mo_os_from_infusion, os_event) ~ crs_outcome, 
+                   data = cilta),
+           # title = "PFS Analysis",
+           font.main = c(20, "bold", "black"),
+           font.x = c(15, "bold", "black"),
+           font.y = c(15, "bold", "black"),
+           font.legend = c(14, "black"),
+           font.tickslab = c(12, "bold", "black"),
+           size = 1.5,
+
+           xlab = "Time (months)",
+           ylab = "OS (probability)",
+           legend = "top",
+           legend.title = "crs_outcome", #legend.labs = c("No", "Yes"),
+           pval = TRUE,
+           conf.int = FALSE,
+           # Censor
+           censor = TRUE,
+           # risk.table = TRUE, risk.table.y.text = TRUE,
+           tables.theme = theme_survminer(#base_size = 5,
+                                          font.main = c(14, "bold", "black"),
+                                          # font.x = c(10, "bold", "black"),
+                                          # font.y = c(16, "bold", "transparent"),
+                                          # font.tickslab = c(19, "bold", "black")
+                                          )
+) %++% guides(colour = guide_legend(nrow = 1))
+
+coxph(Surv(time = cilta$mo_os_from_infusion, 
+                   event = cilta$os_event) ~ crs_outcome, 
+              data = cilta)  %>% 
+  tbl_regression(exponentiate = TRUE) %>% 
+  bold_p(t = .05) %>% 
+  add_nevent(location = "level") %>% add_n(location = "level") %>% as_gt()
+```
+
+### PFS
+Median PFS
+```{r}
+survfit(Surv(mo_pfs_from_infusion, pfs_event) ~ 1, data = cilta)
+survfit(Surv(mo_pfs_from_infusion, pfs_event) ~ crs_outcome, data = cilta)
+```
+
+```{r PFS analysis - KM by crs_outcome}
+ggsurvplot(survfit(Surv(mo_pfs_from_infusion, pfs_event) ~ crs_outcome, 
+                   data = cilta),
+           # title = "PFS Analysis",
+           font.main = c(20, "bold", "black"),
+           font.x = c(15, "bold", "black"),
+           font.y = c(15, "bold", "black"),
+           font.legend = c(14, "black"),
+           font.tickslab = c(12, "bold", "black"),
+           size = 1.5,
+
+           xlab = "Time (months)",
+           ylab = "PSS (probability)",
+           legend = "top",
+           legend.title = "crs_outcome", #legend.labs = c("No", "Yes"),
+           pval = TRUE,
+           conf.int = FALSE,
+           # Censor
+           censor = TRUE,
+           # risk.table = TRUE, risk.table.y.text = TRUE,
+           tables.theme = theme_survminer(#base_size = 5,
+                                          font.main = c(14, "bold", "black"),
+                                          # font.x = c(10, "bold", "black"),
+                                          # font.y = c(16, "bold", "transparent"),
+                                          # font.tickslab = c(19, "bold", "black")
+                                          )
+) %++% guides(colour = guide_legend(nrow = 1))
+
+coxph(Surv(time = cilta$mo_pfs_from_infusion, 
+                   event = cilta$pfs_event) ~ crs_outcome, 
+              data = cilta)  %>% 
+  tbl_regression(exponentiate = TRUE) %>% 
+  bold_p(t = .05) %>% 
+  add_nevent(location = "level") %>% add_n(location = "level") 
+```
+
+## HR 
+```{r}
+coxph(Surv(time = cilta$mo_os_from_infusion, 
+                   event = cilta$os_event) ~ crs_outcome + cytogenetics + 
+        bridging_response_prbetter, 
+              data = cilta)  %>% 
+  tbl_regression(exponentiate = TRUE) %>% 
+  bold_p(t = .05) %>% 
+  add_nevent(location = "level") %>% add_n(location = "level") %>% 
+  modify_spanning_header(everything() ~ "**MVA OS**") %>% as_gt()
+
+
+coxph(Surv(time = cilta$mo_pfs_from_infusion, 
+                   event = cilta$pfs_event) ~ crs_outcome + cytogenetics + 
+        bridging_response_prbetter, 
+              data = cilta)  %>% 
+  tbl_regression(exponentiate = TRUE) %>% 
+  bold_p(t = .05) %>% 
+  add_nevent(location = "level") %>% add_n(location = "level") %>% 
+  modify_spanning_header(everything() ~ "**MVA PFS**") 
+```
+
+
+
+## Modeling (The model training is done on the training set without the imputed values)
+### Using complete cases data 
+```{r, echo = TRUE, class.source= 'fold-hide'}
+model_term <- res_complete_case[["voted_model"]][["model"]]
+```
+The final model is `r model_term`
+
+#### Final modeling on Training
+
+##### Training set performance
+Below is the multivariate model results for this model
+```{r multivariate model results for model with complete cases, echo = TRUE, class.source= 'fold-hide'}
+set.seed(1234)
+model_glm <- 
+  glm(model_term, 
+      data = training_set, 
+      family = "binomial")
+
+model_glm %>% 
+  tbl_regression(exponentiate=TRUE) %>% 
+  bold_labels() %>% 
+  bold_p(t = .05) %>% 
+  add_nevent(location = "level") %>% add_n(location = "level") %>% 
+  modify_caption("**Multivariate Model to identify low-risk CAR T patients - Retaining Suggestive Variables P < 0.15**")
+```
+
+```{r training roc complete cases, echo = TRUE, class.source= 'fold-hide'}
+set.seed(1234)
+train_prob <- 
+  predict(model_glm, newdata = training_set, type = "response")
+train_roc <- 
+  roc(training_set$crs_outcome_glm ~ train_prob, plot = TRUE, print.auc = TRUE)
+
+as.numeric(train_roc$auc)
+```
+
+
+```{r training complete cases, echo = TRUE, class.source= 'fold-hide'}
+truth = training_set$crs_outcome_glm
+
+pred = ifelse(train_prob > 0.5, "1", "0")
+
+# calc_class_err = function(actual, predicted) {
+#   mean(actual != predicted)
+# }
+# calc_class_err(actual = a$truth, predicted = model_glm_pred)
+
+train_tab = table(predicted = pred, actual = truth)
+train_con_mat = confusionMatrix(train_tab, positive = "1")
+c(train_con_mat$overall["Accuracy"],
+  train_con_mat$byClass["Sensitivity"],
+  train_con_mat$byClass["Specificity"])
+```
+
+```{r}
+conf_tab <- train_tab / rowSums(train_tab)
+conf_tab <- as.data.frame(conf_tab, stringsAsFactors = TRUE)
+conf_tab$actual <- factor(conf_tab$actual, rev(levels(conf_tab$actual)))
+
+ggplot(conf_tab, aes(predicted, actual, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = scales::percent(Freq)), size = 3) +
+  scale_fill_gradient(low = "white", high = "#3575b5")+
+  labs(x = "Expected", y = "Predicted", 
+       fill = "Overlap")+
+  theme_classic()+
+  theme(legend.position = "bottom")
+```
+
+
+##### Testing set performance
+```{r pred complete cases, echo = TRUE, class.source= 'fold-hide'}
+test_prob <- 
+  predict(model_glm, newdata = testing_set, type = "response")
+test_roc <- 
+  roc(testing_set$crs_outcome_glm ~ test_prob, plot = TRUE, print.auc = TRUE)
+
+as.numeric(test_roc$auc)
+```
+
+```{r, echo = TRUE, class.source= 'fold-hide'}
+truth = testing_set$crs_outcome_glm
+
+pred = ifelse(predict(model_glm, newdata = testing_set, type = "response") > 0.5, "1", "0")
+
+# calc_class_err = function(actual, predicted) {
+#   mean(actual != predicted)
+# }
+# calc_class_err(actual = a$truth, predicted = model_glm_pred)
+
+test_tab = table(predicted = pred, actual = truth)
+library(caret)
+test_con_mat = confusionMatrix(test_tab, positive = "1")
+c(test_con_mat$overall["Accuracy"],
+  test_con_mat$byClass["Sensitivity"],
+  test_con_mat$byClass["Specificity"])
+```
+
+```{r}
+conf_tab <- test_tab / rowSums(test_tab)
+conf_tab <- as.data.frame(conf_tab, stringsAsFactors = TRUE)
+conf_tab$actual <- factor(conf_tab$actual, rev(levels(conf_tab$actual)))
+
+ggplot(conf_tab, aes(predicted, actual, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = scales::percent(Freq)), size = 3) +
+  scale_fill_gradient(low = "white", high = "#3575b5")+
+  labs(x = "Expected", y = "Predicted", 
+       fill = "Overlap")+
+  theme_classic()+
+  theme(legend.position = "bottom")
+```
+
+### Using data excluding patients with missing values for ferritin
+```{r, echo = TRUE, class.source= 'fold-hide'}
+model_term <- res[["voted_model"]][["model"]]
+
+model_term <- str_remove(model_term, " \\+ pentaref")
+```
+The final model is `r model_term`
+
+```{r from tuto}
+# test_prob <- 
+#   predict(model_glm, newdata = cilta, type = "response")
+# test_roc <- 
+#   roc(cilta$crs_outcome_glm ~ test_prob, plot = TRUE, print.auc = TRUE)
+# 
+# as.numeric(test_roc$auc)
+```
+
+#### Final modeling on Training
+
+
+```{r training and testing table done before}
+# training_set %>% 
+#   mutate(data = "Training") %>% 
+#   bind_rows(., testing_set %>% 
+#   mutate(data = "Testing")) %>% 
+#   tbl_summary(by = data) %>% 
+#   bold_labels() %>% 
+#   add_p() %>% bold_p(t = 0.05) %>% 
+#   add_stat_label() %>% 
+#   remove_footnote_header(columns = everything())
+```
+
+##### Training set performance
+Below is the multivariate model results for this model
+```{r multivariate model results for model with missing, echo = TRUE, class.source= 'fold-hide'}
+set.seed(1234)
+model_glm <- 
+  glm(model_term, 
+      data = training_set, 
+      family = "binomial")
+
+model_glm %>% 
+  tbl_regression(exponentiate=TRUE) %>% 
+  bold_labels() %>% 
+  bold_p(t = .05) %>% 
+  add_nevent(location = "level") %>% add_n(location = "level") %>% 
+  modify_caption("**Multivariate Model to identify low-risk CAR T patients - Retaining Suggestive Variables P < 0.15**")
+```
+
+```{r training roc, echo = TRUE, class.source= 'fold-hide'}
+set.seed(1234)
+train_prob <- 
+  predict(model_glm, newdata = training_set, type = "response")
+train_roc <- 
+  roc(training_set$crs_outcome_glm ~ train_prob, plot = TRUE, print.auc = TRUE)
+
+as.numeric(train_roc$auc)
+```
+
+
+```{r training, echo = TRUE, class.source= 'fold-hide'}
+truth = training_set$crs_outcome_glm
+
+pred = ifelse(train_prob > 0.5, "1", "0")
+
+# calc_class_err = function(actual, predicted) {
+#   mean(actual != predicted)
+# }
+# calc_class_err(actual = a$truth, predicted = model_glm_pred)
+
+train_tab = table(predicted = pred, actual = truth)
+train_con_mat = confusionMatrix(train_tab, positive = "1")
+c(train_con_mat$overall["Accuracy"],
+  train_con_mat$byClass["Sensitivity"],
+  train_con_mat$byClass["Specificity"])
+```
+
+```{r}
+conf_tab <- train_tab / rowSums(train_tab)
+conf_tab <- as.data.frame(conf_tab, stringsAsFactors = TRUE)
+conf_tab$actual <- factor(conf_tab$actual, rev(levels(conf_tab$actual)))
+
+ggplot(conf_tab, aes(predicted, actual, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = scales::percent(Freq)), size = 3) +
+  scale_fill_gradient(low = "white", high = "#3575b5")+
+  labs(x = "Expected", y = "Predicted", 
+       fill = "Overlap")+
+  theme_classic()+
+  theme(legend.position = "bottom")
+```
+
+
+##### Testing set performance
+```{r pred, echo = TRUE, class.source= 'fold-hide'}
+test_prob <- 
+  predict(model_glm, newdata = testing_set, type = "response")
+test_roc <- 
+  roc(testing_set$crs_outcome_glm ~ test_prob, plot = TRUE, print.auc = TRUE)
+
+as.numeric(test_roc$auc)
+```
+
+```{r, echo = TRUE, class.source= 'fold-hide'}
+truth = testing_set$crs_outcome_glm
+
+pred = ifelse(predict(model_glm, newdata = testing_set, type = "response") > 0.5, "1", "0")
+
+# calc_class_err = function(actual, predicted) {
+#   mean(actual != predicted)
+# }
+# calc_class_err(actual = a$truth, predicted = model_glm_pred)
+
+test_tab = table(predicted = pred, actual = truth)
+library(caret)
+test_con_mat = confusionMatrix(test_tab, positive = "1")
+c(test_con_mat$overall["Accuracy"],
+  test_con_mat$byClass["Sensitivity"],
+  test_con_mat$byClass["Specificity"])
+```
+
+```{r}
+conf_tab <- test_tab / rowSums(test_tab)
+conf_tab <- as.data.frame(conf_tab, stringsAsFactors = TRUE)
+conf_tab$actual <- factor(conf_tab$actual, rev(levels(conf_tab$actual)))
+
+ggplot(conf_tab, aes(predicted, actual, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = scales::percent(Freq)), size = 3) +
+  scale_fill_gradient(low = "white", high = "#3575b5")+
+  labs(x = "Expected", y = "Predicted", 
+       fill = "Overlap")+
+  theme_classic()+
+  theme(legend.position = "bottom")
+```
+
+
+### Using data including patients with missing values for ferritin
+```{r, echo = TRUE, class.source= 'fold-hide'}
+model_term <- res_no_missing[["voted_model"]][["model"]]
+
+model_term <- str_remove(model_term, " \\+ pentaref")
+```
+The final model is `r model_term`
+
+Below is the multivariate model results for this model
+```{r multivariate model results for model no missing, echo = TRUE, class.source= 'fold-hide'}
+set.seed(1234)
+model_glm <- 
+  glm(model_term, 
+      data = training_set, 
+      family = "binomial")
+
+model_glm %>% 
+  tbl_regression(exponentiate=TRUE) %>% 
+  bold_labels() %>% 
+  bold_p(t = .05) %>% 
+  add_nevent(location = "level") %>% add_n(location = "level") %>% 
+  modify_caption("**Multivariate Model to identify low-risk CAR T patients - Retaining Suggestive Variables P < 0.15**")
+```
+
+
+
+#### Training set performance
+
+
+```{r training roc no missing, echo = TRUE, class.source= 'fold-hide'}
+set.seed(1234)
+train_prob <- 
+  predict(model_glm, newdata = training_set, type = "response")
+train_roc <- 
+  roc(training_set$crs_outcome_glm ~ train_prob, plot = TRUE, print.auc = TRUE)
+
+as.numeric(train_roc$auc)
+```
+
+
+```{r training no missing, echo = TRUE, class.source= 'fold-hide'}
+truth = training_set$crs_outcome_glm
+
+pred = ifelse(train_prob > 0.5, "1", "0")
+
+# calc_class_err = function(actual, predicted) {
+#   mean(actual != predicted)
+# }
+# calc_class_err(actual = a$truth, predicted = model_glm_pred)
+
+train_tab = table(predicted = pred, actual = truth)
+train_con_mat = confusionMatrix(train_tab, positive = "1")
+c(train_con_mat$overall["Accuracy"],
+  train_con_mat$byClass["Sensitivity"],
+  train_con_mat$byClass["Specificity"])
+```
+
+```{r}
+conf_tab <- train_tab / rowSums(train_tab)
+conf_tab <- as.data.frame(conf_tab, stringsAsFactors = TRUE)
+conf_tab$actual <- factor(conf_tab$actual, rev(levels(conf_tab$actual)))
+
+ggplot(conf_tab, aes(predicted, actual, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = scales::percent(Freq)), size = 3) +
+  scale_fill_gradient(low = "white", high = "#3575b5")+
+  labs(x = "Expected", y = "Predicted", 
+       fill = "Overlap")+
+  theme_classic()+
+  theme(legend.position = "bottom")
+```
+
+
+##### Testing set performance
+```{r pred no missing, echo = TRUE, class.source= 'fold-hide'}
+test_prob <- 
+  predict(model_glm, newdata = testing_set, type = "response")
+test_roc <- 
+  roc(testing_set$crs_outcome_glm ~ test_prob, plot = TRUE, print.auc = TRUE)
+
+as.numeric(test_roc$auc)
+```
+
+```{r, echo = TRUE, class.source= 'fold-hide'}
+truth = testing_set$crs_outcome_glm
+
+pred = ifelse(predict(model_glm, newdata = testing_set, type = "response") > 0.5, "1", "0")
+
+# calc_class_err = function(actual, predicted) {
+#   mean(actual != predicted)
+# }
+# calc_class_err(actual = a$truth, predicted = model_glm_pred)
+
+test_tab = table(predicted = pred, actual = truth)
+library(caret)
+test_con_mat = confusionMatrix(test_tab, positive = "1")
+c(test_con_mat$overall["Accuracy"],
+  test_con_mat$byClass["Sensitivity"],
+  test_con_mat$byClass["Specificity"])
+```
+
+```{r}
+conf_tab <- test_tab / rowSums(test_tab)
+conf_tab <- as.data.frame(conf_tab, stringsAsFactors = TRUE)
+conf_tab$actual <- factor(conf_tab$actual, rev(levels(conf_tab$actual)))
+
+ggplot(conf_tab, aes(predicted, actual, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = scales::percent(Freq)), size = 3) +
+  scale_fill_gradient(low = "white", high = "#3575b5")+
+  labs(x = "Expected", y = "Predicted", 
+       fill = "Overlap")+
+  theme_classic()+
+  theme(legend.position = "bottom")
+```
+
+## Modeling (The model training is done on the training set WITH the imputed values)
+### Using data excluding patients with missing values for ferritin
+```{r, echo = TRUE, class.source= 'fold-hide'}
+model_term <- res[["voted_model"]][["model"]]
+```
+The final model is `r model_term`
+
+
+#### Final modeling on Training
+
+
+##### Training set performance
+Below is the multivariate model results for this model
+```{r multivariate model results for model with missing imputed training, echo = TRUE, class.source= 'fold-hide'}
+set.seed(1234)
+model_glm <- 
+  glm(model_term, 
+      data = training_set_imputed, 
+      family = "binomial")
+
+model_glm %>% 
+  tbl_regression(exponentiate=TRUE) %>% 
+  bold_labels() %>% 
+  bold_p(t = .05) %>% 
+  add_nevent(location = "level") %>% add_n(location = "level") %>% 
+  modify_caption("**Multivariate Model to identify low-risk CAR T patients - Retaining Suggestive Variables P < 0.15**")
+```
+
+```{r training roc imputed training, echo = TRUE, class.source= 'fold-hide'}
+set.seed(1234)
+train_prob <- 
+  predict(model_glm, newdata = training_set_imputed, type = "response")
+train_roc <- 
+  roc(training_set_imputed$crs_outcome_glm ~ train_prob, plot = TRUE, print.auc = TRUE)
+
+as.numeric(train_roc$auc)
+```
+
+
+```{r training imputed training, echo = TRUE, class.source= 'fold-hide'}
+truth = training_set_imputed$crs_outcome_glm
+
+pred = ifelse(train_prob > 0.5, "1", "0")
+
+train_tab = table(predicted = pred, actual = truth)
+train_con_mat = confusionMatrix(train_tab, positive = "1")
+c(train_con_mat$overall["Accuracy"],
+  train_con_mat$byClass["Sensitivity"],
+  train_con_mat$byClass["Specificity"])
+```
+
+```{r}
+conf_tab <- train_tab / rowSums(train_tab)
+conf_tab <- as.data.frame(conf_tab, stringsAsFactors = TRUE)
+conf_tab$actual <- factor(conf_tab$actual, rev(levels(conf_tab$actual)))
+
+ggplot(conf_tab, aes(predicted, actual, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = scales::percent(Freq)), size = 3) +
+  scale_fill_gradient(low = "white", high = "#3575b5")+
+  labs(x = "Expected", y = "Predicted", 
+       fill = "Overlap")+
+  theme_classic()+
+  theme(legend.position = "bottom")
+```
+
+
+##### Testing set performance
+```{r pred imputed training, echo = TRUE, class.source= 'fold-hide'}
+test_prob <- 
+  predict(model_glm, newdata = testing_set, type = "response")
+test_roc <- 
+  roc(testing_set$crs_outcome_glm ~ test_prob, plot = TRUE, print.auc = TRUE)
+
+as.numeric(test_roc$auc)
+```
+
+```{r, echo = TRUE, class.source= 'fold-hide'}
+truth = testing_set$crs_outcome_glm
+
+pred = ifelse(predict(model_glm, newdata = testing_set, type = "response") > 0.5, "1", "0")
+
+test_tab = table(predicted = pred, actual = truth)
+library(caret)
+test_con_mat = confusionMatrix(test_tab, positive = "1")
+c(test_con_mat$overall["Accuracy"],
+  test_con_mat$byClass["Sensitivity"],
+  test_con_mat$byClass["Specificity"])
+```
+
+```{r}
+conf_tab <- test_tab / rowSums(test_tab)
+conf_tab <- as.data.frame(conf_tab, stringsAsFactors = TRUE)
+conf_tab$actual <- factor(conf_tab$actual, rev(levels(conf_tab$actual)))
+
+ggplot(conf_tab, aes(predicted, actual, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = scales::percent(Freq)), size = 3) +
+  scale_fill_gradient(low = "white", high = "#3575b5")+
+  labs(x = "Expected", y = "Predicted", 
+       fill = "Overlap")+
+  theme_classic()+
+  theme(legend.position = "bottom")
+```
+
+
+### Using data including patients with missing values for ferritin
+```{r, echo = TRUE, class.source= 'fold-hide'}
+model_term <- res_no_missing[["voted_model"]][["model"]]
+```
+The final model is `r model_term`
+
+Below is the multivariate model results for this model
+```{r multivariate model results for model no missing imputed training, echo = TRUE, class.source= 'fold-hide'}
+set.seed(1234)
+model_glm <- 
+  glm(model_term, 
+      data = training_set_imputed, 
+      family = "binomial")
+
+model_glm %>% 
+  tbl_regression(exponentiate=TRUE) %>% 
+  bold_labels() %>% 
+  bold_p(t = .05) %>% 
+  add_nevent(location = "level") %>% add_n(location = "level") %>% 
+  modify_caption("**Multivariate Model to identify low-risk CAR T patients - Retaining Suggestive Variables P < 0.15**")
+```
+
+
+#### Training set performance
+
+```{r training roc no missing imputed training, echo = TRUE, class.source= 'fold-hide'}
+set.seed(1234)
+train_prob <- 
+  predict(model_glm, newdata = training_set_imputed, type = "response")
+train_roc <- 
+  roc(training_set_imputed$crs_outcome_glm ~ train_prob, plot = TRUE, print.auc = TRUE)
+
+as.numeric(train_roc$auc)
+```
+
+
+```{r training no missing imputed training, echo = TRUE, class.source= 'fold-hide'}
+truth = training_set_imputed$crs_outcome_glm
+
+pred = ifelse(train_prob > 0.5, "1", "0")
+
+train_tab = table(predicted = pred, actual = truth)
+train_con_mat = confusionMatrix(train_tab, positive = "1")
+c(train_con_mat$overall["Accuracy"],
+  train_con_mat$byClass["Sensitivity"],
+  train_con_mat$byClass["Specificity"])
+```
+
+```{r}
+conf_tab <- train_tab / rowSums(train_tab)
+conf_tab <- as.data.frame(conf_tab, stringsAsFactors = TRUE)
+conf_tab$actual <- factor(conf_tab$actual, rev(levels(conf_tab$actual)))
+
+ggplot(conf_tab, aes(predicted, actual, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = scales::percent(Freq)), size = 3) +
+  scale_fill_gradient(low = "white", high = "#3575b5")+
+  labs(x = "Expected", y = "Predicted", 
+       fill = "Overlap")+
+  theme_classic()+
+  theme(legend.position = "bottom")
+```
+
+
+##### Testing set performance
+```{r pred no missing imputed training, echo = TRUE, class.source= 'fold-hide'}
+test_prob <- 
+  predict(model_glm, newdata = testing_set, type = "response")
+test_roc <- 
+  roc(testing_set$crs_outcome_glm ~ test_prob, plot = TRUE, print.auc = TRUE)
+
+as.numeric(test_roc$auc)
+```
+
+```{r, echo = TRUE, class.source= 'fold-hide'}
+truth = testing_set$crs_outcome_glm
+
+pred = ifelse(predict(model_glm, newdata = testing_set, type = "response") > 0.5, "1", "0")
+
+test_tab = table(predicted = pred, actual = truth)
+library(caret)
+test_con_mat = confusionMatrix(test_tab, positive = "1")
+c(test_con_mat$overall["Accuracy"],
+  test_con_mat$byClass["Sensitivity"],
+  test_con_mat$byClass["Specificity"])
+```
+
+```{r}
+conf_tab <- test_tab / rowSums(test_tab)
+conf_tab <- as.data.frame(conf_tab, stringsAsFactors = TRUE)
+conf_tab$actual <- factor(conf_tab$actual, rev(levels(conf_tab$actual)))
+
+ggplot(conf_tab, aes(predicted, actual, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = scales::percent(Freq)), size = 3) +
+  scale_fill_gradient(low = "white", high = "#3575b5")+
+  labs(x = "Expected", y = "Predicted", 
+       fill = "Overlap")+
+  theme_classic()+
+  theme(legend.position = "bottom")
+```
+
+
+
+
+
+
+<!-- # Other models -->
+<!-- I am using tidymodels to compare multiple pre processors and models.    -->
+<!-- I still need to fix few bugs to make them all work but this is what I was able to do this weekend. -->
+<!-- ```{r} -->
+
+<!-- ``` -->
+
+
+<!-- ```{r} -->
+<!-- training_set1 <- training_set %>%  -->
+<!--   # dplyr:: -->
+<!--   dplyr::select(age_cart, sex,  -->
+<!--          race_eth, -->
+<!--          # ecog_apheresis, ecog_apheresis_cat, -->
+<!--          # ecog_ld, -->
+<!--          ecog_at_ld_cat, -->
+<!--          # ecog_ge_2, -->
+<!--          subtype,# r_iss, -->
+<!--          true_emd, -->
+
+<!--          bsln_bmpc, #bmpc_cat, -->
+<!--          cytogenetics, bsln_b2m_value, -->
+<!--          # bridging_yn, bridging_response, -->
+<!--          bridging_response_prbetter, -->
+<!--          pentaref, -->
+<!--          # prior_tx_lines, -->
+<!--          prior_tx_cat, -->
+
+<!--          priorBCMA, -->
+<!--          # txhistory_priorbmca_list, -->
+<!--          # prior_other_therapy_yn, -->
+<!--          condition_therapy, -->
+<!--          labs_bsln_crp, -->
+<!--          labs_bsln_ferritin, #ferritin_per200, -->
+<!--          medhx_amyloid_yn, medhx_pcl_yn, -->
+<!--          cart_cell_dose_cat, -->
+<!--          eligible_cartitude1,  -->
+<!--          crs_outcome -->
+<!--          ) %>%  -->
+<!--   drop_na() -->
+<!--   # mutate(crs_outcome_glm = case_when( -->
+<!--   #   crs_outcome == "Severe - 0"      ~ 0, -->
+<!--   #   crs_outcome == "Low - 1"         ~ 0 -->
+<!--   # )) -->
+<!--   # mutate(crs_outcome = as.character(crs_outcome)) -->
+<!-- ``` -->
+
+
+
+<!-- ```{r} -->
+<!-- library(tidymodels) -->
+<!-- library(themis) -->
+<!-- library(discrim) # For NaiveB -->
+<!-- # install xgboost, kknn, ranger, kernlab -->
+
+<!-- # 2. Prep recipes---- -->
+<!-- recipe_basic <- -->
+<!--   # 1.model formula -->
+<!--   recipe(crs_outcome ~ ., data = training_set1)  #%>% -->
+<!--   # 2.keep these variables but not use them as either outcomes or predictors -->
+<!--   # update_role(hmdb, new_role = "ID") -->
+
+<!-- recipe_smote <- -->
+<!--   # 1.model formula -->
+<!--   recipe(crs_outcome ~ ., data = training_set1)  %>% -->
+<!--   # 2.keep these variables but not use them as either outcomes or predictors -->
+<!--   # update_role(hmdb, new_role = "ID") %>% -->
+<!--   # 3. Set differential steps -->
+<!--   step_smote(crs_outcome) -->
+
+<!-- recipe_scale <- -->
+<!--   recipe(crs_outcome ~ ., data = training_set1)  %>% -->
+<!--   # update_role(hmdb, new_role = "ID") %>% -->
+<!--   # 3. Set differential steps -->
+<!--   step_scale(all_numeric_predictors()) -->
+
+<!-- recipe_norm <- -->
+<!--   recipe(crs_outcome ~ ., data = training_set1)  %>% -->
+<!--   # update_role(hmdb, new_role = "ID") %>% -->
+<!--   # 3. Set differential steps -->
+<!--   step_normalize(all_numeric_predictors()) -->
+
+<!-- recipe_corr <- -->
+<!--   recipe(crs_outcome ~ ., data = training_set1)  %>% -->
+<!--   # update_role(hmdb, new_role = "ID") %>% -->
+<!--   # 3. Set differential steps -->
+<!--   step_corr(all_numeric_predictors()) -->
+
+<!-- recipe_scale_smote <- -->
+<!--   recipe(crs_outcome ~ ., data = training_set1)  %>% -->
+<!--   # update_role(hmdb, new_role = "ID") %>% -->
+<!--   # 3. Set differential steps -->
+<!--   step_scale(all_numeric_predictors()) %>% -->
+<!--   step_smote(crs_outcome) -->
+
+<!-- recipe_norm_smote <- -->
+<!--   recipe(crs_outcome ~ ., data = training_set1)  %>% -->
+<!--   # update_role(hmdb, new_role = "ID") %>% -->
+<!--   # 3. Set differential steps -->
+<!--   step_normalize(all_numeric_predictors()) %>% -->
+<!--   step_smote(crs_outcome) -->
+
+<!-- recipe_corr_smote <- -->
+<!--   recipe(crs_outcome ~ ., data = training_set1)  %>% -->
+<!--   # update_role(hmdb, new_role = "ID") %>% -->
+<!--   # 3. Set differential steps -->
+<!--   step_corr(all_numeric_predictors()) %>% -->
+<!--   step_smote(crs_outcome) -->
+
+<!-- recipe_scale_corr <- -->
+<!--   recipe(crs_outcome ~ ., data = training_set1)  %>% -->
+<!--   # update_role(hmdb, new_role = "ID") %>% -->
+<!--   # 3. Set differential steps -->
+<!--   step_scale(all_numeric_predictors()) %>% -->
+<!--   step_corr(all_numeric_predictors()) -->
+
+<!-- recipe_norm_corr <- -->
+<!--   recipe(crs_outcome ~ ., data = training_set1)  %>% -->
+<!--   # update_role(hmdb, new_role = "ID") %>% -->
+<!--   # 3. Set differential steps -->
+<!--   step_normalize(all_numeric_predictors()) %>% -->
+<!--   step_corr(all_numeric_predictors()) -->
+
+<!-- recipe_norm_smote_corr <- -->
+<!--   recipe(crs_outcome ~ ., data = training_set1)  %>% -->
+<!--   # update_role(hmdb, new_role = "ID") %>% -->
+<!--   # 3. Set differential steps -->
+<!--   step_normalize(all_numeric_predictors()) %>% -->
+<!--   step_corr(all_numeric_predictors()) %>% -->
+<!--   step_smote(crs_outcome) -->
+
+<!-- recipe_scale_smote_corr <- -->
+<!--   recipe(crs_outcome ~ ., data = training_set1)  %>% -->
+<!--   # update_role(hmdb, new_role = "ID") %>% -->
+<!--   # 3. Set differential steps -->
+<!--   step_scale(all_numeric_predictors()) %>% -->
+<!--   step_corr(all_numeric_predictors()) %>% -->
+<!--   step_smote(crs_outcome) -->
+
+<!-- # Generate List of recipes -->
+<!-- recipe_list <- -->
+<!--   list(basic = recipe_basic, -->
+<!--        # balanced = recipe_smote, -->
+<!--        scaled = recipe_scale, normalized = recipe_norm, -->
+<!--        corr.removed = recipe_corr, -->
+<!--        # balanced.scaled = recipe_scale_smote, balanced.normalized = recipe_norm_smote, -->
+<!--        # balanced.corr = recipe_corr_smote, -->
+<!--        scaled.corr = recipe_scale_corr, normalized.corr = recipe_norm_corr#, -->
+<!--        # balanced.normalized.corr = recipe_norm_smote_corr, -->
+<!--        # balanced.scaled.corr = recipe_scale_smote_corr -->
+<!--        ) -->
+
+<!-- # 3. Generate spec ---- -->
+<!-- nb_spec <- -->
+<!--   naive_Bayes(smoothness = tune(), Laplace = tune()) %>% -->
+<!--   set_engine("klaR") %>% -->
+<!--   set_mode("classification") -->
+
+<!-- dt_spec <- decision_tree(cost_complexity = tune(), tree_depth = tune(), min_n = tune()) %>% -->
+<!--   set_engine("rpart") %>% -->
+<!--   set_mode("classification") -->
+
+<!-- n2_dt_spec <- decision_tree(cost_complexity = tune(), tree_depth = 2, min_n = 2) %>% -->
+<!--   set_engine("rpart") %>% -->
+<!--   set_mode("classification") -->
+
+<!-- svm_spec <- -->
+<!--   svm_rbf(cost = tune(), rbf_sigma = tune(), margin = tune()) %>% -->
+<!--   set_engine("kernlab") %>% -->
+<!--   set_mode("classification") -->
+
+<!-- ranger_spec <- rand_forest( -->
+<!--   mtry = tune(), -->
+<!--   min_n = tune(), -->
+<!--   trees = tune()) %>% -->
+<!--   set_mode("classification") %>% -->
+<!--   set_engine("ranger") -->
+
+<!-- # xgboost_spec <- -->
+<!-- #   boost_tree(trees = tune(), min_n = tune(), tree_depth = tune(), learn_rate = tune(), -->
+<!-- #              loss_reduction = tune(), sample_size = tune()) %>% -->
+<!-- #   set_mode("classification") %>% -->
+<!-- #   set_engine("xgboost") -->
+<!-- #  -->
+<!-- # glmnet_spec <- -->
+<!-- #   logistic_reg(penalty = tune(), mixture = tune()) %>% -->
+<!-- #   set_mode("classification") %>% -->
+<!-- #   set_engine("glmnet") -->
+<!-- #  -->
+<!-- # ridge_spec <- -->
+<!-- #   logistic_reg(penalty = tune(), mixture = 0) %>% -->
+<!-- #   set_mode("classification") %>% -->
+<!-- #   set_engine("glmnet") -->
+<!-- #  -->
+<!-- # lasso_spec <- -->
+<!-- #   logistic_reg(penalty = tune(), mixture = 1) %>% -->
+<!-- #   set_mode("classification") %>% -->
+<!-- #   set_engine("glmnet") -->
+
+<!-- knn_spec <- -->
+<!--   nearest_neighbor(neighbors = tune(), weight_func = tune()) %>% -->
+<!--   set_mode("classification") %>% -->
+<!--   set_engine("kknn") -->
+
+<!-- # 4. Generate list of models---- -->
+<!-- model_list <- -->
+<!--   list(Random_Forest = ranger_spec, SVM = svm_spec, Naive_Bayes = nb_spec, -->
+<!--        Decision_Tree = dt_spec, n2_Decision_Tree = n2_dt_spec, -->
+<!--        # Boosted_Trees = xgboost_spec,  -->
+<!--        KNN = knn_spec#, Elasticnet = glmnet_spec, -->
+<!--        # Ridge_Regression = ridge_spec, Lasso_Regression = lasso_spec -->
+<!--        ) -->
+
+<!-- model_set <- workflow_set(preproc = recipe_list, models = model_list, cross = T) -->
+<!-- ``` -->
+
+<!-- I am first evaluating all combinations pre processors + models on a 10 fold cross validation sets -->
+<!-- ```{r} -->
+<!-- # 5. Create cv fold---- -->
+<!-- set.seed(1234) -->
+<!-- mldata_folds <- vfold_cv(training_set1, strata = crs_outcome) -->
+<!-- ``` -->
+
+<!-- ```{r} -->
+<!-- # 6. Run workflows on the training dataset of 1799 -->
+<!-- class_metric <- metric_set(accuracy, roc_auc, recall, precision, #pr_auc, -->
+<!--                            sensitivity, specificity) -->
+
+<!-- doParallel::registerDoParallel() -->
+<!-- set.seed(1234) -->
+<!-- all_workflows <- -->
+<!--   model_set %>% workflow_map(resamples = mldata_folds, -->
+<!--                              metrics = class_metric, -->
+<!--                              verbose = TRUE, -->
+<!--                              control = control_resamples(save_pred = TRUE)) -->
+
+
+<!-- write_rds(all_workflows, paste0("all_workflows_", today(), ".rds")) -->
+
+<!-- # all_workflows <-  -->
+<!-- #   read_rds(paste0(here::here(),  -->
+<!-- #                   "/all_workflows_.rds")) -->
+<!-- ``` -->
+
+<!-- # 1. Visualize performance comparison of combined workflows - Explore Tuning param -->
+<!-- ```{r} -->
+<!-- # Figure S2 Accuracy all models-preprocessors---- -->
+<!-- collect_metrics(all_workflows) %>% -->
+<!--   separate(wflow_id, into = c("Recipe", "Model_Type"), sep = "_", remove = F, extra = "merge") %>% -->
+<!--   filter(.metric == "roc_auc") %>% -->
+<!--   group_by(wflow_id) %>% -->
+<!--   filter(mean == max(mean)) %>% # equivalent to select_best after tuning -->
+<!--   group_by(model) %>% -->
+<!--   dplyr::select(-.config) %>% -->
+<!--   distinct() %>% -->
+<!--   ungroup() %>% -->
+<!--   mutate(Workflow_Rank =  row_number(-mean), -->
+<!--          .metric = str_to_upper(.metric)) %>% -->
+<!--   # mutate(Model_Type = case_when( -->
+<!--   #   Model_Type = "Decision_Tree"         ~ "Decision tree", -->
+<!--   #   Model_Type = "Random_Forest"         ~ "Random forest",  -->
+<!--   #   Model_Type = "KNN"                   ~ "KNN",  -->
+<!--   #   Model_Type = "Elasticnet"            ~ "Elasticnet",  -->
+<!--   #   Model_Type = "Lasso_Regression"      ~ "Lasso regression",  -->
+<!--   #   Model_Type = "n2_Decision_Tree"      ~ "Trimmed decision tree",  -->
+<!--   #   Model_Type = "Boosted_Trees"         ~ "Boosted trees", -->
+<!--   #   Model_Type = "Ridge_Regression"      ~ "Ridge regression",  -->
+<!--   #   Model_Type = "SVM"                   ~ "SVM",  -->
+<!--   #   Model_Type = "Naive_Bayes"           ~ "Naive bayes" -->
+<!--   # )) %>%  -->
+<!--   # mutate(Model_Type = factor(Model_Type, -->
+<!--   #                            levels = c("Decision_Tree", "Random_Forest",  -->
+<!--   #                                       "KNN", "Elasticnet", "Lasso_Regression",  -->
+<!--   #                                       "n2_Decision_Tree",  -->
+<!--   #                                       "Boosted_Trees", -->
+<!--   #                                       "Ridge_Regression",  -->
+<!--   #                                       "SVM", "Naive_Bayes" -->
+<!--   #                            ))) %>% -->
+<!--   filter(!is.na(Model_Type)) %>% -->
+<!--   # mutate(Recipe = factor(Recipe, -->
+<!--   #                        levels = c("basic", "corr.removed", "normalized", "scaled", "Imputed", -->
+<!--   #                                   "normalized.corr", "scaled.corr", "Imputed.corr", -->
+<!--   #                                   "Imputed.normalized", "Imputed.scaled", -->
+<!--   #                                   "Imputed.normalized.corr", "Imputed.scaled.corr" -->
+<!--   #                        ))) %>%  -->
+<!--   arrange(desc(mean)) %>%  -->
+<!--   # mutate(mn = 0.912) %>% mutate(mx = 0.94) %>% -->
+<!--   ggplot(aes(x=Workflow_Rank, y = mean, shape = Recipe, color = Model_Type)) + -->
+<!--   # geom_rect(aes(xmin = -Inf, xmax = Inf, -->
+<!--   #           ymin = mn, ymax = mx), -->
+<!--   #           fill= "grey90", color= "transparent")+ -->
+<!--   geom_point(size = 3) + -->
+<!--   geom_errorbar(aes(ymin = mean-std_err, ymax = mean+std_err)) + -->
+<!--   # geom_hline(aes(yintercept = 0.926), color= "darkgrey", linetype= 2)+ -->
+<!--   # ylim(0.57, 0.95)+ -->
+<!--   # scale_colour_manual(labels = c("Decision tree", "Random forest",  -->
+<!--   #                                "KNN", "Elasticnet", "Lasso regression",  -->
+<!--   #                                "Trimmed decision tree",  -->
+<!--   #                                "Boosted trees", -->
+<!--   #                                "Ridge regression",  -->
+<!--   #                                "SVM", "Naive bayes"),  -->
+<!--   #                     values=c("#8DA0CB", "#FC8D62", "#B2DF8A", "#CAB2D6", "#E5C494", -->
+<!--   #                              "#66C2A5", "#FFD92F", "#E78AC3", "#A6CEE3", "#B3B3B3"))+ -->
+<!--   # scale_shape_manual(labels = c("Basic", "Reduced", "Normalized", "Scaled", "Imputed", -->
+<!--   #                               "Normalized+Reduced", "Scaled+Reduced", "Imputed+Reduced", -->
+<!--   #                               "Imputed+Normalized", "Imputed+Scaled", -->
+<!--   #                               "Imputed+Normalized+Reduced", "Imputed+Scaled+Reduced"), -->
+<!--   #                    values=c(0, 15, 1, 16, 2, 17, 8, 18, 3, 7, 25, 4))+ -->
+<!--   labs(#title = "Performance Comparison of Workflow Sets",  -->
+<!--        x = "Workflow Rank", -->
+<!--        y = "ROC AUC", color = "Models", shape = "Preprocessors")+ -->
+<!--   theme(legend.position = "bottom", legend.box = "vertical") + -->
+<!--   guides(fill=guide_legend(nrow = 6, byrow = TRUE)) -->
+
+
+<!-- a <- collect_metrics(all_workflows) %>% -->
+<!--   separate(wflow_id, into = c("Recipe", "Model_Type"), sep = "_", remove = F, extra = "merge") %>% -->
+<!--   filter(.metric == "roc_auc") %>% -->
+<!--   group_by(wflow_id) %>% -->
+<!--   filter(mean == max(mean)) %>% # equivalent to select_best after tuning -->
+<!--   group_by(model) %>% -->
+<!--   dplyr::select(-.config) %>% -->
+<!--   distinct() %>% -->
+<!--   ungroup() %>% -->
+<!--   mutate(Workflow_Rank =  row_number(-mean), -->
+<!--          .metric = str_to_upper(.metric)) %>%  -->
+<!--   filter(!is.na(Model_Type)) %>% -->
+<!--   arrange(desc(mean)) %>%  -->
+<!--   distinct(Model_Type) -->
+<!-- ``` -->
+<!-- This shows us that the different pre processors I am comparing here mostly don't produce better performance that the "basic" or no pre-processors added. The best models seems to be `r str_replace(a$Model_Type[1], "_", " ")`.    -->
+
+<!-- ```{r} -->
+<!-- # compare_all <- collect_metrics(all_workflows) %>% -->
+<!-- #   separate(wflow_id, into = c("Recipe", "Model_Type"), sep = "_", remove = F, extra = "merge") %>%  -->
+<!-- #   filter(Recipe == "basic") %>%  -->
+<!-- #   group_by(wflow_id, .metric) %>% -->
+<!-- #   mutate(selected_model = case_when( -->
+<!-- #     .metric == "accuracy" & -->
+<!-- #       mean == max(mean)            ~ "selected" -->
+<!-- #   )) %>%  -->
+<!-- #   filter(selected_model == "selected") %>%  -->
+<!-- #   group_by(model) %>% -->
+<!-- #   distinct(pick(!contains(".config")), .keep_all = TRUE) %>% -->
+<!-- #   ungroup() -->
+<!-- #  -->
+<!-- # prauc_data <- collect_predictions(all_workflows, summarize = FALSE) %>%  -->
+<!-- #   separate(wflow_id, into = c("Recipe", "Model_Type"), sep = "_", remove = F, extra = "merge") %>% -->
+<!-- #   filter(Recipe == "basic") %>% -->
+<!-- #   left_join(compare_all %>%  -->
+<!-- #               dplyr::select(wflow_id, .config, .estimator, Model_Type), ., -->
+<!-- #             by = c("wflow_id", ".config", "Model_Type")) -->
+<!-- # prauc_data1 <- prauc_data %>%  -->
+<!-- #   group_by(wflow_id, Recipe, Model_Type, id) %>% -->
+<!-- #   pr_auc(crs_outcome, .pred_No, event_level = "first") %>%  -->
+<!-- #   group_by(wflow_id, Recipe, Model_Type) %>% -->
+<!-- #   summarize(mean = mean(`.estimate`), -->
+<!-- #             std_err = sd(`.estimate`)) %>%  -->
+<!-- #   mutate(`.metric` = "pr_auc_No") %>%  -->
+<!-- #   ungroup() -->
+<!-- # prauc_data2 <- prauc_data %>%  -->
+<!-- #   group_by(wflow_id, Recipe, Model_Type, id) %>% -->
+<!-- #   pr_auc(crs_outcome, .pred_Yes, event_level = "first") %>%  -->
+<!-- #   group_by(wflow_id, Recipe, Model_Type) %>% -->
+<!-- #   summarize(mean = mean(`.estimate`), -->
+<!-- #             std_err = sd(`.estimate`)) %>%  -->
+<!-- #   mutate(`.metric` = "pr_auc_Yes") %>%  -->
+<!-- #   ungroup() -->
+<!-- #  -->
+<!-- # compare_all <- collect_metrics(all_workflows) %>% -->
+<!-- #   separate(wflow_id, into = c("Recipe", "Model_Type"), sep = "_", remove = F, extra = "merge") %>%  -->
+<!-- #   filter(Recipe == "basic") %>%  -->
+<!-- #   left_join(compare_all %>%  -->
+<!-- #               dplyr::select(wflow_id, .config, Model_Type), ., -->
+<!-- #             by = c("wflow_id", ".config", "Model_Type")) %>%  -->
+<!-- #   bind_rows(prauc_data1, prauc_data2, .) -->
+<!-- # rm(prauc_data, prauc_data1, prauc_data2) -->
+<!-- #  -->
+<!-- #  -->
+<!-- # metrics_data <- compare_all %>%  -->
+<!-- #   dplyr::select(wflow_id, .metric, mean) %>%  -->
+<!-- #   mutate(mean = round(mean, 3)) %>%  -->
+<!-- #   # group_by(wflow_id) %>%  -->
+<!-- #   pivot_wider(id_cols = wflow_id,  -->
+<!-- #               names_from = .metric,  -->
+<!-- #               values_from = mean) %>%  -->
+<!-- #   mutate(id = c(4, 1, 5, 8, 7, 10, 3, 6, 9, 2)) %>%  -->
+<!-- #   arrange(id) %>%  -->
+<!-- #   dplyr::select(wflow_id, pr_auc_No, pr_auc_Yes, accuracy, sensitivity, -->
+<!-- #                 specificity, precision, recall, roc_auc) -->
+<!-- #  -->
+<!-- # library(kableExtra) -->
+<!-- # library(formattable) -->
+<!-- # metrics_data %>%  -->
+<!-- #   mutate(pr_auc_No = ifelse(pr_auc_No > 0.93, -->
+<!-- #                             cell_spec(pr_auc_No, background = "lightgreen"), -->
+<!-- #                             cell_spec(pr_auc_No) -->
+<!-- #   ), -->
+<!-- #   pr_auc_Yes = ifelse(pr_auc_Yes > 0.61, -->
+<!-- #                       cell_spec(pr_auc_Yes, background = "lightgreen"), -->
+<!-- #                       cell_spec(pr_auc_Yes) -->
+<!-- #   ), -->
+<!-- #   accuracy = ifelse(accuracy > 0.87, -->
+<!-- #                     cell_spec(accuracy, background = "lightgreen"), -->
+<!-- #                     cell_spec(accuracy) -->
+<!-- #   ), -->
+<!-- #   sensitivity = ifelse(sensitivity > 0.95, -->
+<!-- #                        cell_spec(sensitivity, background = "lightgreen"), -->
+<!-- #                        cell_spec(sensitivity) -->
+<!-- #   ), -->
+<!-- #   specificity = ifelse(specificity > 0.6, -->
+<!-- #                        cell_spec(specificity, background = "lightgreen"), -->
+<!-- #                        cell_spec(specificity) -->
+<!-- #   ) -->
+<!-- #   ) %>%  -->
+<!-- #   kableExtra::kable(escape = F) %>% -->
+<!-- #   kableExtra::kable_classic(full_width = T, html_font = "Cambria", font_size = 16) %>% -->
+<!-- #   kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) -->
+<!-- #  -->
+<!-- # metrics_data <- metrics_data %>%  -->
+<!-- #   mutate(rank_prauc_no = rank(-pr_auc_No), .after= pr_auc_No) %>%  -->
+<!-- #   mutate(rank_prauc_yes = rank(-pr_auc_Yes), .after= pr_auc_Yes) %>%  -->
+<!-- #   mutate(rank_accuracy = rank(-accuracy), .after= accuracy) %>%  -->
+<!-- #   mutate(rank_rocauc = rank(-roc_auc), .after= roc_auc) %>%  -->
+<!-- #   mutate(rank_sum = rowSums(dplyr::select(., starts_with("rank_"))), .after= 1) %>%  -->
+<!-- #   mutate(final_rank = rank(rank_sum), .after= 1) %>%  -->
+<!-- #   arrange(final_rank) -->
+<!-- # write_rds(metrics_data, "metrics_data.rds") -->
+<!-- # write_csv(metrics_data, "metrics_data.csv") -->
+<!-- ``` -->
+
+<!-- <!-- # 8. Modeling on training and evaluating on testing with fold---- --> -->
+<!-- ```{r} -->
+<!-- set.seed(1234) -->
+<!-- final_rf <- all_workflows %>% -->
+<!--   extract_workflow("basic_Random_Forest") %>% -->
+<!--   finalize_workflow(all_workflows %>% -->
+<!--                       extract_workflow_set_result("basic_Random_Forest") %>% -->
+<!--                       select_best(metric = "roc_auc")) -->
+
+<!-- set.seed(1234) -->
+<!-- final_knn <- all_workflows %>% -->
+<!--   extract_workflow("basic_KNN") %>% -->
+<!--   finalize_workflow(all_workflows %>% -->
+<!--                       extract_workflow_set_result("basic_KNN") %>% -->
+<!--                       select_best(metric = "roc_auc")) -->
+
+<!-- # set.seed(1234) -->
+<!-- # final_elastinet <- all_workflows %>% -->
+<!-- #   extract_workflow("basic_Elasticnet") %>% -->
+<!-- #   finalize_workflow(all_workflows %>% -->
+<!-- #                       extract_workflow_set_result("basic_Elasticnet") %>% -->
+<!-- #                       select_best(metric = "roc_auc")) -->
+<!-- #  -->
+<!-- # set.seed(1234) -->
+<!-- # final_lasso <- all_workflows %>% -->
+<!-- #   extract_workflow("basic_Lasso_Regression") %>% -->
+<!-- #   finalize_workflow(all_workflows %>% -->
+<!-- #                       extract_workflow_set_result("basic_Lasso_Regression") %>% -->
+<!-- #                       select_best(metric = "roc_auc")) -->
+<!-- #  -->
+<!-- # set.seed(1234) -->
+<!-- # final_ridge <- all_workflows %>% -->
+<!-- #   extract_workflow("basic_Ridge_Regression") %>% -->
+<!-- #   finalize_workflow(all_workflows %>% -->
+<!-- #                       extract_workflow_set_result("basic_Ridge_Regression") %>% -->
+<!-- #                       select_best(metric = "roc_auc")) -->
+
+<!-- set.seed(1234) -->
+<!-- final_svm <- all_workflows %>% -->
+<!--   extract_workflow("basic_SVM") %>% -->
+<!--   finalize_workflow(all_workflows %>% -->
+<!--                       extract_workflow_set_result("basic_SVM") %>% -->
+<!--                       select_best(metric = "roc_auc")) -->
+
+<!-- set.seed(1234) -->
+<!-- final_dt <- all_workflows %>% -->
+<!--   extract_workflow("basic_Decision_Tree") %>% -->
+<!--   finalize_workflow(all_workflows %>% -->
+<!--                       extract_workflow_set_result("basic_Decision_Tree") %>% -->
+<!--                       select_best(metric = "roc_auc")) -->
+
+<!-- set.seed(1234) -->
+<!-- final_trimmed_dt <- all_workflows %>% -->
+<!--   extract_workflow("basic_n2_Decision_Tree") %>% -->
+<!--   finalize_workflow(all_workflows %>% -->
+<!--                       extract_workflow_set_result("basic_n2_Decision_Tree") %>% -->
+<!--                       select_best(metric = "roc_auc")) -->
+
+<!-- # set.seed(1234) -->
+<!-- # final_boosted_tree <- all_workflows %>% -->
+<!-- #   extract_workflow("basic_Boosted_Trees") %>% -->
+<!-- #   finalize_workflow(all_workflows %>% -->
+<!-- #                       extract_workflow_set_result("basic_Boosted_Trees") %>% -->
+<!-- #                       select_best(metric = "roc_auc")) -->
+
+<!-- set.seed(1234) -->
+<!-- final_nb <- all_workflows %>% -->
+<!--   extract_workflow("basic_Naive_Bayes") %>% -->
+<!--   finalize_workflow(all_workflows %>% -->
+<!--                       extract_workflow_set_result("basic_Naive_Bayes") %>% -->
+<!--                       select_best(metric = "roc_auc")) -->
+
+<!-- # Model spec ---- -->
+<!-- final_rf$fit$actions$model$spec -->
+<!-- final_knn$fit$actions$model$spec -->
+<!-- final_dt$fit$actions$model$spec -->
+<!-- final_trimmed_dt$fit$actions$model$spec -->
+<!-- # final_elastinet$fit$actions$model$spec -->
+<!-- # final_lasso$fit$actions$model$spec -->
+<!-- # final_ridge$fit$actions$model$spec -->
+<!-- # final_boosted_tree$fit$actions$model$spec -->
+<!-- final_svm$fit$actions$model$spec -->
+<!-- final_nb$fit$actions$model$spec -->
+
+<!-- # Run -->
+<!-- set.seed(1234) -->
+<!-- rf_results <- final_rf %>% -->
+<!--   fit_resamples( -->
+<!--     resamples = mldata_folds, -->
+<!--     metrics = metric_set(roc_auc, accuracy, sensitivity, specificity, precision, recall#, pr_auc -->
+<!--     ), -->
+<!--     control = control_resamples(save_pred = TRUE, verbose = TRUE) -->
+<!--   ) -->
+<!-- set.seed(1234) -->
+<!-- knn_results <- final_knn %>% -->
+<!--   fit_resamples( -->
+<!--     resamples = mldata_folds, -->
+<!--     metrics = metric_set(roc_auc, accuracy, sensitivity, specificity, precision, recall#, pr_auc -->
+<!--     ), -->
+<!--     control = control_resamples(save_pred = TRUE) -->
+<!--   ) -->
+<!-- # set.seed(1234) -->
+<!-- # elastinet_results <- final_elastinet %>% -->
+<!-- #   fit_resamples( -->
+<!-- #     resamples = mldata_folds, -->
+<!-- #     metrics = metric_set(roc_auc, accuracy, sensitivity, specificity, precision, recall#, pr_auc -->
+<!-- #     ), -->
+<!-- #     control = control_resamples(save_pred = TRUE, verbose = TRUE) -->
+<!-- #   ) -->
+<!-- # set.seed(1234) -->
+<!-- # lasso_results <- final_lasso %>% -->
+<!-- #   fit_resamples( -->
+<!-- #     resamples = mldata_folds, -->
+<!-- #     metrics = metric_set(roc_auc, accuracy, sensitivity, specificity, precision, recall#, pr_auc -->
+<!-- #     ), -->
+<!-- #     control = control_resamples(save_pred = TRUE) -->
+<!-- #   ) -->
+<!-- # set.seed(1234) -->
+<!-- # ridge_results <- final_ridge %>% -->
+<!-- #   fit_resamples( -->
+<!-- #     resamples = mldata_folds, -->
+<!-- #     metrics = metric_set(roc_auc, accuracy, sensitivity, specificity, precision, recall#, pr_auc -->
+<!-- #     ), -->
+<!-- #     control = control_resamples(save_pred = TRUE) -->
+<!-- #   ) -->
+<!-- set.seed(1234) -->
+<!-- svm_results <- final_svm %>% -->
+<!--   fit_resamples( -->
+<!--     resamples = mldata_folds, -->
+<!--     metrics = metric_set(roc_auc, accuracy, sensitivity, specificity, precision, recall#, pr_auc -->
+<!--     ), -->
+<!--     control = control_resamples(save_pred = TRUE, verbose = TRUE) -->
+<!--   ) -->
+<!-- set.seed(1234) -->
+<!-- dt_results <- final_dt %>% -->
+<!--   fit_resamples( -->
+<!--     resamples = mldata_folds, -->
+<!--     metrics = metric_set(roc_auc, accuracy, sensitivity, specificity, precision, recall#, pr_auc -->
+<!--     ), -->
+<!--     control = control_resamples(save_pred = TRUE, verbose = TRUE) -->
+<!--   ) -->
+<!-- set.seed(1234) -->
+<!-- trimmed_dt_results <- final_trimmed_dt %>% -->
+<!--   fit_resamples( -->
+<!--     resamples = mldata_folds, -->
+<!--     metrics = metric_set(roc_auc, accuracy, sensitivity, specificity, precision, recall#, pr_auc -->
+<!--     ), -->
+<!--     control = control_resamples(save_pred = TRUE, verbose = TRUE) -->
+<!--   ) -->
+<!-- # set.seed(1234) -->
+<!-- # boosted_tree_results <- final_boosted_tree %>% -->
+<!-- #   fit_resamples( -->
+<!-- #     resamples = mldata_folds, -->
+<!-- #     metrics = metric_set(roc_auc, accuracy, sensitivity, specificity, precision, recall#, pr_auc -->
+<!-- #     ), -->
+<!-- #     control = control_resamples(save_pred = TRUE, verbose = TRUE) -->
+<!-- #   ) -->
+<!-- set.seed(1234) -->
+<!-- nb_results <- final_nb %>% -->
+<!--   fit_resamples( -->
+<!--     resamples = mldata_folds, -->
+<!--     metrics = metric_set(roc_auc, accuracy, sensitivity, specificity, precision, recall#, pr_auc -->
+<!--     ), -->
+<!--     control = control_resamples(save_pred = TRUE, verbose = TRUE) -->
+<!--   ) -->
+<!-- # write_rds(list(rf_results, knn_results, elastinet_results,  -->
+<!-- #                lasso_results, ridge_results, svm_results),  -->
+<!-- #           "dat.rds") -->
+
+<!-- # a <- read_rds(paste0(here::here(), "/dat.rds")) -->
+<!-- write_rds(rf_results, "rf_results.rds") -->
+<!-- write_rds(knn_results, "knn_results.rds") -->
+<!-- # write_rds(elastinet_results, "elastinet_results.rds") -->
+<!-- # write_rds(lasso_results, "lasso_results.rds") -->
+<!-- # write_rds(ridge_results, "ridge_results.rds") -->
+<!-- write_rds(svm_results, "svm_results.rds") -->
+<!-- write_rds(dt_results, "dt_results.rds") -->
+<!-- write_rds(trimmed_dt_results, "trimmed_dt_results.rds") -->
+<!-- # write_rds(boosted_tree_results, "boosted_tree_results.rds") -->
+<!-- write_rds(nb_results, "nb_results.rds") -->
+
+<!-- # Load model results---- -->
+<!-- # rf_results <- read_rds(paste0(here::here(), "/rf_results.rds")) -->
+<!-- # knn_results <- read_rds(paste0(here::here(), "/knn_results.rds")) -->
+<!-- # # elastinet_results <- read_rds(paste0(here::here(), "/elastinet_results.rds")) -->
+<!-- # # lasso_results <- read_rds(paste0(here::here(), "/lasso_results.rds")) -->
+<!-- # # ridge_results <- read_rds(paste0(here::here(), "/ridge_results.rds")) -->
+<!-- # svm_results <- read_rds(paste0(here::here(), "/svm_results.rds")) -->
+<!-- # dt_results <- read_rds(paste0(here::here(), "/dt_results.rds")) -->
+<!-- # trimmed_dt_results <- read_rds(paste0(here::here(), "/trimmed_dt_results.rds")) -->
+<!-- # # boosted_tree_results <- read_rds(paste0(here::here(), "/boosted_tree_results.rds")) -->
+<!-- # nb_results <- read_rds(paste0(here::here(), "/nb_results.rds")) -->
+<!-- ``` -->
+
+<!-- <!-- # Examine performance on the 10 fold training set --> -->
+<!-- ```{r} -->
+<!-- # accuracy, roc_auc, sensitivity, specificity, precision, recall -->
+<!-- rf_results %>% # Compare both models -->
+<!--   collect_metrics() %>% -->
+<!--   dplyr::select(".metric", rf_mean = mean) %>% -->
+<!--   full_join(., dt_results %>% -->
+<!--               collect_metrics() %>% -->
+<!--               dplyr::select(".metric", dt_mean = mean), by = ".metric") %>% -->
+<!--   full_join(., svm_results %>%  -->
+<!--               collect_metrics() %>% -->
+<!--               dplyr::select(".metric", tree_mean = mean), by = ".metric") %>%  -->
+<!--   full_join(., knn_results %>% -->
+<!--               collect_metrics() %>% -->
+<!--               dplyr::select(".metric", knn_mean = mean), by = ".metric") %>%  -->
+<!--   full_join(., nb_results %>% -->
+<!--               collect_metrics() %>% -->
+<!--               dplyr::select(".metric", nb_mean = mean), by = ".metric") %>%  -->
+<!--   mutate(across(where(is.numeric), ~ round(., 3))) -->
+
+<!-- rf_results %>% # Compare both models -->
+<!--   collect_metrics() %>% -->
+<!--   mutate(model = "rf") %>% -->
+<!--   bind_rows(dt_results %>% -->
+<!--               collect_metrics() %>% -->
+<!--               mutate(model = "dt")) %>% -->
+<!--   bind_rows(., svm_results %>%  -->
+<!--               collect_metrics() %>% -->
+<!--               mutate(model = "smv")) %>% -->
+<!--   bind_rows(knn_results %>% -->
+<!--               collect_metrics() %>% -->
+<!--               mutate(model = "knn")) %>% -->
+<!--   bind_rows(nb_results %>% -->
+<!--               collect_metrics() %>% -->
+<!--               mutate(model = "nb")) %>% -->
+<!--   # mutate(model = factor(model, levels= c("tree", "rf", "knn","n2_tree"))) %>%  -->
+
+<!--   ggplot(aes(x= .metric, y=mean, fill = model))+ -->
+<!--   geom_bar(stat = "identity", -->
+<!--            position = position_dodge())+ -->
+<!--   geom_errorbar(aes(x = .metric, -->
+<!--                     ymin = mean - std_err, -->
+<!--                     ymax = mean + std_err), -->
+<!--                 width = 0.2, alpha = 0.5, -->
+<!--                 position=position_dodge(width=0.9))+ -->
+<!--   scale_fill_manual(values = c("#8DA0CB", "#FC8D62", "#B2DF8A", "#66C2A5", "red"),  -->
+<!--                     name= NULL) -->
+
+<!-- # roc -->
+<!-- rf_results %>% # Compare both models -->
+<!--   collect_predictions() %>% -->
+<!--   mutate(model = "rf") %>% -->
+<!--   bind_rows(dt_results %>% -->
+<!--               collect_predictions() %>% -->
+<!--               mutate(model = "dt")) %>% -->
+<!--   bind_rows(., svm_results %>%  -->
+<!--               collect_predictions() %>% -->
+<!--               mutate(model = "smv")) %>% -->
+<!--   bind_rows(knn_results %>% -->
+<!--               collect_predictions() %>% -->
+<!--               mutate(model = "knn")) %>% -->
+<!--   bind_rows(nb_results %>% -->
+<!--               collect_predictions() %>% -->
+<!--               mutate(model = "nb")) %>% -->
+<!--   # mutate(model = factor(model, levels= c("tree", "rf", "knn","n2_tree"))) %>%  -->
+
+<!--   group_by(model) %>% -->
+<!--   roc_curve(crs_outcome, `.pred_Severe - 0`) %>% -->
+<!--   autoplot()+ -->
+<!--   scale_color_manual(values = c("#8DA0CB", "#FC8D62", "#B2DF8A", "#66C2A5", "red"), name= NULL)+ -->
+<!--   ggtitle("Area under Curve ROC (Receiver Operating Characteristics)") -->
+
+<!-- # pr -->
+<!-- # trimmed_dt_results %>% # Compare both models -->
+<!-- #   collect_predictions() %>% -->
+<!-- #   mutate(model = "n2_tree") %>% -->
+<!-- #   bind_rows(rf_results %>% -->
+<!-- #               collect_predictions() %>% -->
+<!-- #               mutate(model = "rf")) %>% -->
+<!-- #   bind_rows(., tree_results %>%  -->
+<!-- #               collect_predictions() %>% -->
+<!-- #               mutate(model = "tree")) %>% -->
+<!-- #   bind_rows(knn_results %>% -->
+<!-- #               collect_predictions() %>% -->
+<!-- #               mutate(model = "knn")) %>% -->
+<!-- #   mutate(model = factor(model, levels= c("tree", "rf", "knn","n2_tree"))) %>%  -->
+<!-- #   group_by(model) %>% -->
+<!-- #   pr_curve(crs_outcome, .pred_Yes) %>% -->
+<!-- #   autoplot()+ -->
+<!-- #   scale_color_manual(values = c("#8DA0CB", "#FC8D62", "#B2DF8A", "#66C2A5"), name= NULL)+ -->
+<!-- #   ggtitle("Area under the precision recall curve - \nYes prediction") -->
+<!-- # n2_tree_results %>% # Compare both models -->
+<!-- #   collect_predictions() %>% -->
+<!-- #   mutate(model = "n2_tree") %>% -->
+<!-- #   bind_rows(rf_results %>% -->
+<!-- #               collect_predictions() %>% -->
+<!-- #               mutate(model = "rf")) %>% -->
+<!-- #   bind_rows(., tree_results %>%  -->
+<!-- #               collect_predictions() %>% -->
+<!-- #               mutate(model = "tree")) %>% -->
+<!-- #   bind_rows(knn_results %>% -->
+<!-- #               collect_predictions() %>% -->
+<!-- #               mutate(model = "knn")) %>% -->
+<!-- #   group_by(model) %>% -->
+<!-- #   pr_auc(crs_outcome, .pred_Yes) %>%  -->
+<!-- #   mutate(.metric = "pr_auc_Yes") %>%  -->
+<!-- #   arrange(-.estimate) %>%  -->
+<!-- #   mutate(across(where(is.numeric), ~ round(., 3))) -->
+<!-- #  -->
+<!-- # n2_tree_results %>% # Compare both models -->
+<!-- #   collect_predictions() %>% -->
+<!-- #   mutate(model = "n2_tree") %>% -->
+<!-- #   bind_rows(rf_results %>% -->
+<!-- #               collect_predictions() %>% -->
+<!-- #               mutate(model = "rf")) %>% -->
+<!-- #   bind_rows(., tree_results %>%  -->
+<!-- #               collect_predictions() %>% -->
+<!-- #               mutate(model = "tree")) %>% -->
+<!-- #   bind_rows(knn_results %>% -->
+<!-- #               collect_predictions() %>% -->
+<!-- #               mutate(model = "knn")) %>% -->
+<!-- #   mutate(model = factor(model, levels= c("tree", "rf", "knn","n2_tree"))) %>%  -->
+<!-- #   group_by(model) %>% -->
+<!-- #   pr_curve(crs_outcome, .pred_No) %>% -->
+<!-- #   autoplot()+ -->
+<!-- #   scale_color_manual(values = c("#8DA0CB", "#FC8D62", "#B2DF8A", "#66C2A5"), name= NULL)+ -->
+<!-- #   ggtitle("Area under the precision recall curve - \nNo prediction") -->
+<!-- # n2_tree_results %>% # Compare both models -->
+<!-- #   collect_predictions() %>% -->
+<!-- #   mutate(model = "n2_tree") %>% -->
+<!-- #   bind_rows(rf_results %>% -->
+<!-- #               collect_predictions() %>% -->
+<!-- #               mutate(model = "rf")) %>% -->
+<!-- #   bind_rows(., tree_results %>%  -->
+<!-- #               collect_predictions() %>% -->
+<!-- #               mutate(model = "tree")) %>% -->
+<!-- #   bind_rows(knn_results %>% -->
+<!-- #               collect_predictions() %>% -->
+<!-- #               mutate(model = "knn")) %>% -->
+<!-- #   group_by(model) %>% -->
+<!-- #   pr_auc(crs_outcome, .pred_No) %>%  -->
+<!-- #   mutate(.metric = "pr_auc_No") %>%  -->
+<!-- #   arrange(-.estimate) %>%  -->
+<!-- #   mutate(across(where(is.numeric), ~ round(., 3))) -->
+
+<!-- ``` -->
+
+<!-- # 5. Fit on the whole training / predict on testing data (1799 data)---- -->
+<!-- ```{r} -->
+<!-- final_rf <- all_workflows %>%  -->
+<!--   extract_workflow("basic_Random_Forest") %>%  -->
+<!--   finalize_workflow(all_workflows %>%  -->
+<!--                       extract_workflow_set_result("basic_Random_Forest") %>%  -->
+<!--                       select_best(metric = "roc_auc")) %>%  -->
+<!--   fit(training_set) -->
+<!-- final_dt <- all_workflows %>%  -->
+<!--   extract_workflow("basic_Decision_Tree") %>%  -->
+<!--   finalize_workflow(all_workflows %>%  -->
+<!--                       extract_workflow_set_result("basic_Decision_Tree") %>%  -->
+<!--                       select_best(metric = "roc_auc")) %>%  -->
+<!--   fit(training_set) -->
+<!-- final_knn <- all_workflows %>%  -->
+<!--   extract_workflow("basic_KNN") %>%  -->
+<!--   finalize_workflow(all_workflows %>%  -->
+<!--                       extract_workflow_set_result("basic_KNN") %>%  -->
+<!--                       select_best(metric = "roc_auc")) %>%  -->
+<!--   fit(training_set) -->
+<!-- final_smv <- all_workflows %>%  -->
+<!--   extract_workflow("basic_SVM") %>%  -->
+<!--   finalize_workflow(all_workflows %>%  -->
+<!--                       extract_workflow_set_result("basic_SVM") %>%  -->
+<!--                       select_best(metric = "roc_auc")) %>%  -->
+<!--   fit(training_set) -->
+<!-- # final_nb <- all_workflows %>%  -->
+<!-- #   extract_workflow("basic_Naive_Bayes") %>%  -->
+<!-- #   finalize_workflow(all_workflows %>%  -->
+<!-- #                       extract_workflow_set_result("basic_Naive_Bayes") %>%  -->
+<!-- #                       select_best(metric = "roc_auc")) %>%  -->
+<!-- #   fit(training_set) -->
+
+<!-- ``` -->
+
+<!-- ```{r} -->
+<!-- some_metrics <- metric_set(roc_auc, accuracy, sensitivity, specificity) -->
+<!-- ``` -->
+
+
+<!-- ```{r} -->
+<!-- # Get predictions on the training set -->
+<!-- performance_training_rf <- augment(final_rf, new_data = training_set) %>%  -->
+<!--   # Evaluate the metric set -->
+<!--   some_metrics(crs_outcome, `.pred_Severe - 0`, estimate = .pred_class) -->
+
+<!-- performance_training_dt <- augment(final_dt, new_data = training_set) %>%  -->
+<!--   # Evaluate the metric set -->
+<!--   some_metrics(crs_outcome, `.pred_Severe - 0`, estimate = .pred_class) -->
+
+<!-- # performance_training_knn <- augment(final_knn, new_data = training_set) %>%  -->
+<!-- #   # Evaluate the metric set -->
+<!-- #   some_metrics(crs_outcome, `.pred_Severe - 0`, estimate = .pred_class) -->
+
+<!-- # performance_training_smv <- augment(final_smv, new_data = training_set) %>%  -->
+<!-- #   # Evaluate the metric set -->
+<!-- #   some_metrics(crs_outcome, `.pred_Severe - 0`, estimate = .pred_class) -->
+<!-- ``` -->
+
+
+<!-- ```{r} -->
+<!-- performance_testing_rf <- augment(final_rf, new_data = testing_set) %>%  -->
+<!--   some_metrics(crs_outcome, `.pred_Severe - 0`, estimate = .pred_class) -->
+
+<!-- performance_testing_dt <- augment(final_dt, new_data = testing_set) %>%  -->
+<!--   # Evaluate the metric set -->
+<!--   some_metrics(crs_outcome, `.pred_Severe - 0`, estimate = .pred_class) -->
+
+<!-- # performance_testing_knn <- augment(final_knn, new_data = testing_set) %>%  -->
+<!-- #   # Evaluate the metric set -->
+<!-- #   some_metrics(crs_outcome, `.pred_Severe - 0`, estimate = .pred_class) -->
+<!-- #  -->
+<!-- # performance_testing_smv <- augment(final_smv, new_data = testing_set) %>%  -->
+<!-- #   # Evaluate the metric set -->
+<!-- #   some_metrics(crs_outcome, `.pred_Severe - 0`, estimate = .pred_class) -->
+<!-- ``` -->
+
+<!-- ```{r} -->
+<!-- a <- full_join(performance_training_rf %>% rename(rf_estimate = .estimate), -->
+<!--                performance_training_dt %>% rename(dt_estimate = .estimate),  -->
+<!--                by = c(".metric", ".estimator")) %>%  -->
+<!--   mutate(dataset = "Training") -->
+<!-- b <- full_join(performance_testing_rf %>% rename(rf_estimate = .estimate), -->
+<!--                performance_testing_dt %>% rename(dt_estimate = .estimate),  -->
+<!--                by = c(".metric", ".estimator")) %>%  -->
+<!--   mutate(dataset = "Testing") -->
+
+<!-- a %>% -->
+<!--   bind_rows(., b) %>%  -->
+<!--   mutate(.metric = case_when( -->
+<!--     .metric == "accuracy"           ~ "Accuracy", -->
+<!--     .metric == "roc_auc"            ~ "ROC AUC", -->
+<!--     .metric == "pr_auc_No"          ~ "PR AUC (No)", -->
+<!--     .metric == "pr_auc_Yes"         ~ "PR AUC (Yes)", -->
+<!--     TRUE                           ~ .metric -->
+<!--   )) %>% -->
+<!--   dplyr::select("Performance Metrics" = .metric, -->
+<!--                 "Random Forest" = rf_estimate, -->
+<!--                 "Decision Tree" = dt_estimate,  -->
+<!--                 "Dataset" = dataset) %>%  -->
+<!--   kable() -->
+<!-- write_csv(a, "Performance table.csv") -->
+<!-- ``` -->
+
+<!-- ```{r} -->
+<!-- a %>% -->
+<!--   bind_rows(., b) %>%  -->
+<!--   mutate(.metric = case_when( -->
+<!--     .metric == "accuracy"           ~ "Accuracy", -->
+<!--     .metric == "roc_auc"            ~ "ROC AUC", -->
+<!--     .metric == "pr_auc_No"          ~ "PR AUC (No)", -->
+<!--     .metric == "pr_auc_Yes"         ~ "PR AUC (Yes)", -->
+<!--     TRUE                           ~ .metric -->
+<!--   )) %>% -->
+<!--   pivot_longer(cols = c(rf_estimate, dt_estimate)) %>%  -->
+<!--   ggplot(aes(x=value, y=name, fill=name))+ -->
+<!--   geom_bar(stat = "identity")+ -->
+<!--   labs(x= "", y= "Performance estimate", fill = NULL)+ -->
+<!--   scale_fill_viridis_d(option = "F")+ -->
+<!--   coord_flip()+ -->
+<!--   theme(legend.position = "bottom")+ -->
+<!--   guides(fill = guide_legend(nrow = 2,byrow=TRUE))+ -->
+<!--   facet_wrap(. ~ dataset) -->
+<!-- ``` -->
+<!-- This shows that we don't have over fitting -->
+
+<!-- ```{r} -->
+
+<!-- ``` -->
+
+
+
+
+
+
+
+
+

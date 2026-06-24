@@ -1,0 +1,1286 @@
+---
+title: "Complete case outpatient predictive modeling"
+author: "Christelle Colin-Leitzinger"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: false
+    theme: united
+    highlight: pygments
+    df_print: paged
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+<style type= "text/css">
+
+. figure {
+   margin-top: 25px;
+   margin-bottom: 100px;
+}
+
+table {
+    margin-top: 10px;
+    margin-bottom: 25px;
+}
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,
+                      warning = FALSE,
+                      message = FALSE,
+                      cache = FALSE,
+                      fig.align='center'
+                      )
+```
+
+```{r library}
+library(here)
+library(tidyverse)
+library(ggplot2)
+library(gtsummary)
+library(labelled)
+library(DescTools)
+library(survival)
+library(survminer)
+library(StepReg)
+library(caret)
+library(pROC)
+library(splitTools)
+theme_set(theme_classic())
+theme_gtsummary_compact()
+```
+
+```{r load}
+path_raw <- fs::path("","Volumes","Peres_Research", "Myeloma", "Consortium Data", "May 2025")
+path_save <- fs::path("","Volumes","Peres_Research", "Myeloma", "Analyses", "")
+
+load(paste0(#path_raw, 
+           here(), "/data",
+           "/Cleaned_Consortium_Datasets_31Jul2025.RData"))
+rm(combined_abecma, combined_iec, combined_aml)
+```
+
+This project aims to build a predictive model to identify low-risk CAR T patients that could be managed in the outpatient setting. I’ve provided some information on how to define the low-risk patients (the outcome) and potential predictors below.
+
+Outcome
+1 = patients with no CRS or grade 1 CRS, no ICANS, and no IEC-HS
+0 = patients with grade 2 or higher CRS, patients with any ICANS, and patients with IEC-HS
+
+
+```{r case cleaning}
+combined_cart <- combined_cart %>% 
+  # General
+  # Fix letter case
+  mutate(across(c(where(is.character),
+                  -c("patientid",
+                     "heavychain",
+                     "bridging_response",
+                     "r_iss", "updated_death_cause",
+                     "eligible_cartitude1_reason",
+                     contains("response"),
+                     starts_with("ORR_"),
+                     starts_with("CRorbetter")
+                     )),
+                ~ str_to_sentence(.) )) %>% 
+  mutate(across(c("updated_death_cause", "Site"), 
+                ~ str_to_lower(.)))
+```
+
+
+```{r general cleaning}
+data1 <- combined_cart %>% 
+  mutate(Site1 = str_replace_all(Site, " ", "_")) %>% 
+  unite(col = patientid, c(cart_dataset, patientid, Site1), 
+        sep = "-", 
+        remove = FALSE) %>% 
+  select(-Site1) %>% 
+  # Fix numerical
+  mutate_at(c("age_cart"
+                  ), 
+                ~ as.numeric(.)) %>%
+  # Sex categories
+  mutate(male_sex = case_when(
+    sex == "Male"                                    ~ 1,
+    sex == "Female"                                  ~ 0
+  )) %>% 
+  # ECOG
+  mutate(ecog_apheresis_cat = case_when(
+    ecog_apheresis == 0 |
+      ecog_apheresis == 1                            ~ "0-1",
+    ecog_apheresis %in% c(2:4)                       ~ "2-4"
+  ), .after = ecog_apheresis) %>%
+  mutate(ecog_at_ld_cat = case_when(
+    ecog_ld == 0 |
+      ecog_ld == 1                                   ~ "0-1",
+    ecog_ld %in% c(2:4)                              ~ "2-4"
+  ), .after = ecog_ld) %>%
+  mutate_at(c("ecog_apheresis", "ecog_ld"), ~ factor(.)) %>% 
+  # Cytogenetics ----
+  mutate(cytogenetics = case_when(
+    deletion_17p_tp53 == "Yes" | 
+      t_414_yn == "Yes" | 
+      t_1416_yn == "Yes"             ~ "Yes",
+    deletion_17p_tp53 == "No" &
+      t_414_yn == "No" &
+      t_1416_yn == "No"               ~ "No",
+    TRUE                                                           ~ NA_character_
+  ), .before = deletion_17p_tp53) #%>% 
+  
+  
+  # Fix date
+  # mutate(across(c("date_of_diagnosis"), 
+  #        ~ as.Date(as.numeric(.), origin = "1899-12-30"))) #%>% 
+  # mutate_at(c("date_of_diagnosis",
+  #             "labs_max_crp_dt", 
+  #             "max_crs_dt", 
+  #             "max_icans_dt"), ~ as.Date(., format = "%m/%d/%y"))
+
+
+# Updated cause of death data and NRM
+# data1 <- data1 %>%
+#   mutate(nrm_n = case_when( os_event==1 & prog==1 ~ 0, #censor all deaths after progression (regardless of cause - includes SPM)
+#                           os_event==1 & updated_death_cause %in% c(NA, "unknown") ~ NA_integer_, #if died and unknown cause then missing
+#                           os_event==1 & updated_death_cause=="myeloma" ~ 0, #if died from myeloma then censor
+#                           os_event==1  ~ 1, #otherwise don't censor
+#                           os_event==0  ~ 0, # censor alive
+#                           TRUE ~ NA_integer_))
+
+
+# data1 <- data1 %>% 
+#   mutate(updated_death_cause = case_when(
+#     # str_detect(patientid, "LCI-14") | str_detect(patientid, "LCI-25") | str_detect(patientid, "LCI-26")        ~ "infection",
+#     # str_detect(patientid, "LCI-16")                                                        ~ "spm",
+#     # str_detect(patientid, "LCI-23") | str_detect(patientid, "LCI-55") | str_detect(patientid, "LCI-67") | 
+#     #   str_detect(patientid, "LCI-74") | str_detect(patientid, "LCI-76") | str_detect(patientid, "LCI-79") | 
+#     #   str_detect(patientid, "CAR002") | str_detect(patientid, "MCC-CAR8")                            ~ "myeloma",
+#     # Site == "mdacc" & str_detect(patientid, "44")                                          ~ "myeloma",
+#     # str_detect(patientid, "LCI-73")                                                        ~ "icans",
+#     # str_detect(patientid, "LCI-77")                                                        ~ "iec",
+#     # Site=="mdacc" & str_detect(patientid, "91")                                            ~ "crs",
+#     # str_detect(patientid, "LCI-15")                                                        ~ "unknown",
+#     # str_detect(patientid, "MCC-CAR88")                                                     ~ "unknown",
+#     Site=="hackensack" & str_detect(patientid, "21")                                       ~ "unknown",
+#     TRUE                                                                         ~ updated_death_cause
+#   )) #%>% 
+  # mutate(NRM = case_when(
+  #   str_detect(patientid, "LCI-14" | str_detect(patientid, "LCI-25" | str_detect(patientid, "LCI-26"        ~ 1,
+  #   str_detect(patientid, "LCI-16"                                                       ~ 1,
+  #   str_detect(patientid, "LCI-23" | str_detect(patientid, "LCI-55" | str_detect(patientid, "LCI-67" | 
+  #     str_detect(patientid, "LCI-74" | str_detect(patientid, "LCI-76" | str_detect(patientid, "LCI-79" | 
+  #     str_detect(patientid, "CAR002" | str_detect(patientid, "MCC-CAR8"                            ~ 0,
+  #   Site == "mdacc" & str_detect(patientid, "44"                            ~ 0,
+  #   str_detect(patientid, "LCI-73"                                                       ~ 1,
+  #   str_detect(patientid, "LCI-77"                                                       ~ 1,
+  #   Site=="mdacc" & str_detect(patientid, "91"                                                       ~ 1,
+  #   str_detect(patientid, "LCI-15"                                                       ~ NA_real_,
+  #   str_detect(patientid, "MCC-CAR88"                                                       ~ NA_real_,
+  #   Site=="hackensack" & str_detect(patientid, "21"                                                       ~ NA_real_,
+  #   TRUE                                                                                  ~ NRM
+  # ))
+```
+
+```{r therapy}
+data1 <- data1 %>%
+  # CART dose
+  mutate(cart_infusion_dose = as.numeric(cart_infusion_dose)) %>% 
+  mutate(cart_cell_dose_cat = case_when(
+    cart_infusion_dose < 0.7                   ~ "< 0.7",
+    cart_infusion_dose >= 0.7                  ~ "≥ 0.7"
+  )) %>% 
+  mutate(prior_tx_cat = case_when(
+    prior_tx_lines <= 3                        ~ "1-3",
+    prior_tx_lines <= 5                        ~ "4-5",
+    prior_tx_lines >= 6                        ~ "≥6"
+  ), prior_tx_cat = factor(prior_tx_cat, levels = 
+                             c("1-3", "4-5", "≥6")
+  )) %>% 
+  mutate(condition_therapy = case_when(
+    str_detect(str_to_lower(condition_therapy), "flu") &
+      str_detect(str_to_lower(condition_therapy), "cy")       ~ "fludarabine + cytoxan",
+    str_detect(str_to_lower(condition_therapy), "clad") &
+      str_detect(str_to_lower(condition_therapy), "cy")       ~ "cladribine + cytoxan",
+    TRUE                                                      ~ str_to_lower(condition_therapy)
+  )) %>% 
+  mutate(txhistory_priorbmca_list = case_when(
+    txhistory_priorbmca_list == "None" |
+      txhistory_priorbmca_list == "No" |
+      txhistory_priorbmca_list == "N/a" |
+      txhistory_priorbmca_list == "Na"         ~ NA_character_,
+    TRUE                                       ~ txhistory_priorbmca_list
+  )) %>% 
+  # BCMA
+  mutate(prior_bcma_therapy = case_when(
+    !is.na(txhistory_priorbmca_list)           ~ "Yes",
+    str_detect(
+      str_to_upper(eligible_cartitude1_reason), 
+      "BCMA")                                  ~ "Yes",
+    str_detect(
+      str_to_upper(eligible_cartitude1_reason), 
+      "TECLISTAMAB")                           ~ "Yes",
+    str_detect(
+      str_to_upper(eligible_cartitude1_reason), 
+      "TALQ")                                  ~ "Yes",
+    
+    is.na(txhistory_priorbmca_list)            ~ "No"
+  )) %>% 
+  # Lauren's updated code
+  mutate(priorBCMA = case_when( # used a combination of prior therapy, bcma list, and ineligible for cartitude1 reason
+    is.na(prior_other_therapy_yn) ~ NA_character_,
+    str_detect(patientid, "Roswell28") ~ "No",
+    str_detect(patientid, "12") & Site == "michigan"  ~ "No",
+    prior_other_therapy_yn == "Yes" & txhistory_priorbmca_list == "Talquetamab" ~ "No",
+    prior_other_therapy_yn == "Yes" & txhistory_priorbmca_list == "talq" ~ "No",
+    prior_other_therapy_yn == "Yes" ~ "Yes",
+    prior_other_therapy_yn == "No" & txhistory_priorbmca_list == "Teclistimab" ~ "Yes",
+    prior_other_therapy_yn == "No" & txhistory_priorbmca_list == "Teneo biospeficic (TENIO 383B)" ~ "Yes",
+    prior_other_therapy_yn == "No" ~ "No"
+  )) %>% 
+  # Fix bridging - no need anymore
+  # mutate(bridging_yn= case_when(
+  #   Site == "hackensack" & bridging_yn == "Yes" ~ "No",
+  #   Site == "hackensack" & bridging_yn == "No" ~ "Yes",
+  #   Site == "hackensack" & is.na(bridging_yn) ~ NA_character_,
+  #   Site == "fhcc" & bridging_yn == "Yes" ~ "No",
+  #   Site == "fhcc" & bridging_yn == "No" ~ "Yes",
+  #   Site == "fhcc" & is.na(bridging_yn) ~ NA_character_,
+  #   TRUE ~ bridging_yn
+  # )) %>% 
+  mutate(bridging_response_prbetter = case_when(
+    bridging_response == "Not Evaluable"       ~ NA_character_,
+    str_detect(bridging_response, "CR|PR")     ~ "PR or better",
+    bridging_yn == "No" & 
+      is.na(bridging_response)                 ~ "No bridging",
+    !is.na(bridging_response)                  ~ "< PR",
+    is.na(bridging_response)                   ~ NA_character_,
+    TRUE                                       ~ bridging_response
+  ), .after = bridging_response
+  ) %>% 
+  mutate(bridging_response_prbetter = factor(
+    bridging_response_prbetter, levels = c("No bridging", "< PR", "PR or better")
+  ))
+
+# DONE above
+  # mutate(bridging_response_cat = case_when(
+  #   bridging_yn == "No" & is.na(bridging_response) ~ "No bridging",
+  #   TRUE ~ bridging_response_cat
+  # )) %>% 
+  # mutate(bridging_response_cat_v2 = case_when(
+  #   bridging_yn == "No" & Site == "hackensack" ~ "No bridging",
+  #   bridging_yn == "No" & Site == "fhcc" ~ "No bridging",
+  #   bridging_yn == "No" & is.na(bridging_response) ~ "No bridging",
+  #   bridging_yn == "Yes" & is.na(bridging_response_cat) ~ "Bridging, unknown response",
+  #   TRUE ~ bridging_response_cat
+  # ))
+a <- data1 %>% select(patientid, Site, bridging_yn, bridging_response_prbetter, bridging_response)
+# Cilta_data_FHR$bridging_response_cat_v2 <- factor(Cilta_data_FHR$bridging_response_cat_v2, levels = c("No bridging", "PR or better", "PD/SD", "Bridging, unknown response"))
+ 
+
+ 
+
+  
+
+a <- data1 %>% select(patientid, prior_other_therapy_yn, txhistory_priorbmca_list, eligible_cartitude1_reason, prior_bcma_therapy)
+
+  # write_csv(data1 %>% select(txhistory_priorbmca_list) %>% filter(!is.na(txhistory_priorbmca_list)) %>%  distinct(), "List of BCMA drugs in the txhistory_priorbmca_list variable.csv")
+# write_csv(data1 %>% filter(prior_other_therapy_yn == "Yes" & is.na(txhistory_priorbmca_list)) %>% 
+#             select(patientid, Site, prior_other_therapy_yn, txhistory_priorbmca_list, eligible_cartitude1_reason), 
+#           "Patients with other therapies but not BCMA.csv")
+
+```
+
+```{r toxicities}
+data1 <- data1 %>% 
+  # CRS
+  # Remove NAs to duration and make as num
+  mutate(crs_duration_days = as.numeric(crs_duration_days)) %>% 
+  # Fix iec_hs_yn if updated_death_cause is HLH
+  mutate(iec_hs_yn = case_when(
+    # all HLH cause of death are not counted as iec, adding back
+    str_detect(updated_death_cause, "hlh")          ~ "Yes",
+    # not needed now but adding this line as warning for next update if it happens
+    str_detect(updated_death_cause, "iec")          ~ "Yes",
+    TRUE                                            ~ iec_hs_yn
+  )) %>% 
+  mutate(crs_outcome_detailled = case_when(
+         (max_crs_grd == 0 |
+            max_crs_grd == 1) &
+            (max_icans_grd == 0 &
+               iec_hs_yn == "No")                    ~ "Low - 1",
+         (max_crs_grd == 0 |
+            max_crs_grd == 1) &
+            (is.na(max_icans_grd) |
+               is.na(iec_hs_yn))                     ~ "no icans OR no iec data",
+         
+         (max_crs_grd == 0 |
+            max_crs_grd == 1) &
+            (max_icans_grd > 0 |
+               iec_hs_yn == "Yes")                   ~ "Severe - 0",
+         
+         # (max_crs_grd == 1 &
+         #   is.na(crs_duration_days)) &
+         #    (max_icans_grd > 0 &
+         #       iec_hs_yn == "Yes")                   ~ "Severe - 0",
+         
+         # (max_crs_grd == 1 &
+         #   is.na(crs_duration_days))                 ~ "CRS 1 but no duration",
+         
+         # (max_crs_grd == 1 &
+         #   crs_duration_days < 14) &
+         #    (max_icans_grd == 0 &
+         #       iec_hs_yn == "No")                    ~ "Low - 1",
+         
+         # (max_crs_grd == 1 &
+         #   crs_duration_days < 14) &
+         #    (is.na(max_icans_grd) |
+         #       is.na(iec_hs_yn))                     ~ "no icans OR no iec data",
+         
+         max_crs_grd %in% c(2:5)                     ~ "Severe - 0",
+         !is.na(max_crs_grd)                         ~ "check",
+         TRUE                                        ~ NA_character_
+       )) %>% 
+  mutate(crs_outcome = factor(crs_outcome_detailled, levels = c("Severe - 0", "Low - 1")))
+
+a <- data1 %>% select(patientid, max_crs_grd, crs_duration_days,crs_outcome, crs_outcome_detailled, max_icans_grd, iec_hs_yn, updated_death_cause)
+
+
+# cleaning delayed NT based on query responses from Surbhi
+# data1 <- data1 %>% 
+#   mutate(other_neurotox_yn = case_when(
+#    Site == "hackensack" & str_detect(patientid, "23") ~ "Yes",
+#    str_detect(patientid, "FH-C14") ~ "Yes",
+#    str_detect(patientid, "CCT5019-0857") ~ "Yes",
+#    Site == "hackensack" & str_detect(patientid, "21") ~ "Yes",
+#    Site == "hackensack" & str_detect(patientid, "66") ~ "Yes",
+#    Site == "hackensack" & str_detect(patientid, "27") ~ "Yes",
+#    str_detect(patientid, "FH-C6") ~ "Yes",
+#    Site == "hackensack" & str_detect(patientid, "70") ~ "Yes",
+#    Site == "hackensack" & str_detect(patientid, "34") ~ "Yes",
+#    Site == "hackensack" & str_detect(patientid, "10") ~ "No",
+#    str_detect(patientid, "KUMC_106") ~ "No",
+#    str_detect(patientid, "KUMC_121") ~ "No",
+#    str_detect(patientid, "CAR007") & Site == "columbia" ~ "No",
+#    str_detect(other_neurotox_list, "ATN") ~ "No",
+#    other_neurotox_list == "ICANS" ~ "No",
+#    other_neurotox_list == "Cognitive decline" ~ "No",
+#    other_neurotox_list == "pill rolling tremor 8/2" ~ "No",
+#    other_neurotox_list == "slowed cognition" ~ "No",
+#    TRUE ~ other_neurotox_yn
+# )) %>% 
+#   mutate(parkinson_neurotox_yn = case_when(
+#     other_neurotox_list == "Cognitive decline" ~ "Yes",
+#     other_neurotox_list == "pill rolling tremor 8/2" ~ "Yes",
+#     other_neurotox_list == "slowed cognition" ~ "Yes",
+#     TRUE ~ parkinson_neurotox_yn
+# )) %>% 
+#   mutate(other_neurotox_cat = case_when(
+#   is.na(other_neurotox_yn) ~ NA_character_,
+#   other_neurotox_yn == "Yes" & str_detect(other_neurotox_list, "alsy") ~ "Cranial nerve palsy",
+#   other_neurotox_yn == "Yes" & str_detect(other_neurotox_list, "droop") ~ "Cranial nerve palsy",
+#   other_neurotox_yn == "Yes" & str_detect(other_neurotox_list, "CN") ~ "Cranial nerve palsy",
+#   other_neurotox_yn == "Yes" ~ "Other",
+#   other_neurotox_yn == "No" ~ "No"
+# )) %>% 
+#   mutate(any_delay_neurotox_yn = case_when(
+#   is.na(parkinson_neurotox_yn) & is.na(other_neurotox_yn) ~ NA_character_,
+#   parkinson_neurotox_yn == "Yes" | other_neurotox_yn == "Yes" ~ "Yes",
+#   TRUE ~ "No"
+# ))
+```
+
+```{r disease}
+data2 <- data1 %>%
+# Myeloma
+  mutate(oligo_nonsecretory_chris = case_when(
+    oligo_nonsecretory == "Non-secretory"        ~ "Yes",
+    oligo_nonsecretory == "Oligosecretory"       ~ "Yes",
+    TRUE                                             ~ oligo_nonsecretory
+  ))
+```
+
+```{r baseline}
+data2 <- data2 %>%
+  mutate(bsln_bmpc_cat25 = case_when(
+    bsln_bmpc < 25          ~ "bsln_bmpc < 25",
+    bsln_bmpc >= 25         ~ "bsln_bmpc ≥ 25"
+  )) %>% 
+  mutate(bsln_bmpc_cat65 = case_when(
+    bsln_bmpc < 65          ~ "bsln_bmpc < 65",
+    bsln_bmpc >= 65         ~ "bsln_bmpc ≥ 65"
+  )) %>% 
+#   mutate(labs_platelets_preld = 
+#            as.numeric(str_extract_all(labs_platelets_preld, "[[:digit:]]+"))
+#   )  %>% 
+  mutate(bsln_ferr_cat400 = case_when(
+    labs_bsln_ferritin < 400          ~ "bsln_ferr < 400",
+    labs_bsln_ferritin >= 400         ~ "bsln_ferr ≥ 400"
+  )) %>% 
+  mutate(bsln_crp_cat05 = case_when(
+    labs_bsln_crp < 0.5          ~ "bsln_ferr < 0.5",
+    labs_bsln_crp >= 0.5         ~ "bsln_ferr ≥ 0.5"
+  )) %>% 
+  mutate(ferritin_per200 = labs_bsln_ferritin / 200)
+```
+
+```{r EMD}
+cilta <- data2 %>% 
+  mutate(true_emd = case_when(
+    extramedu_yn == "Yes" & 
+      medhx_paraskeletal_yn == "No"              ~ "Yes", 
+    extramedu_yn == "Yes" & 
+      medhx_paraskeletal_yn == "Yes"             ~ "No",
+    extramedu_yn == "No"                         ~ "No", 
+    is.na(medhx_paraskeletal_yn)                 ~ NA_character_,
+    TRUE                                         ~ "check"
+  ))
+a <- cilta %>% select(patientid, extramedu_yn, medhx_paraskeletal_yn, true_emd)
+```
+
+
+```{r Labeling}
+# Labeling ----
+var_label(cilta) <- list(age_cart = "Patient age", agecat = "Patient age - Categories",
+                         male_sex = "Male Sex", sex = "Sex",
+                         race_eth = "Race and ethnicity",
+                         mo_os_from_infusion = "Follow-up time from infusion (months)",
+                         extramedu_yn = "Extramedullary disease",
+                         medhx_amyloid_yn = "Amyloidosis",
+                         medhx_pcl_yn = "Plasma cell leukemia",
+                         # circulating_plasma_cell = "UPDATED Circulating Plasma Cells",
+                         bsln_burden_ge50pct = "High marrow burden (≥50%)",
+                         ecog_ld = "ECOG at LD",
+                         # `ECOG > or = 2? (Yes, No)` ,
+                         r_iss = "R-ISS at cart infusion",
+                         cytogenetics = "High risk cytogenetics (not include gain 1q)",
+                         deletion_17p_tp53 = "Deletion 17p at Infusion",
+                         t_414_yn = "t(4:14) at Infusion",
+                         t_1416_yn = "t(4:16) at Infusion",
+                         copyalteration_1q21 = "Gain/amp 1q21",
+                         # number_of_prior_lines_of_therapy = "Number of prior lines of therapy",
+                         # number_prior_lines_therapy = "Number of prior lines of therapy (cat)",
+                         prior_other_therapy_yn = "Prior other therapy",
+                         bridging_yn = "Bridging therapy",
+                         bridging_response = "Bridging response (detailled)",
+                         bridging_response_prbetter = "Bridging response (PR or better)",
+                         prior_auto_sct_yn = "Prior autoSCT",
+                         prior_allo_sct_yn = "Prior alloSCT",
+                         prior_tx_cat = "Number of prior regimens (cat)",
+                         
+                         condition_therapy = "Lymphodepletion chemotherapy",
+                         priorBCMA = "Prior BCMA-directed therapy",
+                         # need_for_g_csf_post_infus_yes_1_no_0 = "Granulocyte colony stimulating factor (G-CSF)",
+                         # need_for_ivig_yes_1_no_0 = "Intravenous immunoglobulin (IVIG)",
+                         # cd34_stem_cell_boost_yes_1_no_0 = "CD34 stem cell boost",
+                         # tpo_agonist_post_cart_yes_1_no_0 = "Thrombopoietin (TPO) agonist",
+                         # bmicat = "BMI at apheresis - Normal, Overweight, Obese",
+                         # steroid_use_yes_no = "Steroid Use", tocilizumab_yes_no = "Tocilizumab Use",
+                         # anakinra_yes_no = "Anakinra Use",
+                         proteasome = "Refractory to Proteasome Inhibitors",
+                         # lenalidomide_exposed_vs_refractory_vs_not_exposed = "Refractory to Lenalidomide",
+                         # bortezomib_exposed_vs_refractory_vs_not_exposed = "Refractory to Bortezomib",
+                         # carfilzomib_exposed_vs_refractory_vs_not_exposed = "Refractory to Carfilzomib",
+                         # pomalidomide_exposed_vs_refractory_vs_not_exposed = "Refractory to Pomalidomide",
+                         dara = "Refractory to Daratumumab or Isatuximab",
+                         immuno = "Refractory to Immunomodulators", doubleref = "Double refractory",
+                         tripleref= "Triple refractory", pentaref= "Penta refractory",
+                         # bmicat2 = "BMI at apheresis - Normal vs. Overweight/Obese",
+                         CRS_any = "Any CRS", CRS_gradecat = "CRS Grade",
+                         ICANS_any = "Any ICANS", ICANS_gradecat = "ICANS Grade",
+                         # day_of_onset_crs_relative_to_infusion = "Day of onset of CRS relative to infusion",
+                         # day_of_max_crs_relative_to_infusion = "Day of Max CRS (relative to infusion)",
+                         crs_duration_days = "Duration of CRS (days)",
+                         # day_of_onset_icans_relative_to_infusion = "Day of onset of ICANS relative to infusion",
+                         # day_of_max_icans_relative_to_infusion = "Day of Max ICANS (relative to infusion)",
+                         icans_duration_days = "Duration of ICANS (days)",
+                         # delayed_neuro = "Delayed Neurotoxicity",
+                         # parkinsonian_neurotoxicity_yes_no = "Parkinsonian Neurotoxicity",
+                         # other_delayed_non_parkinsonian_neurologic_toxicity_yes_no =
+                         #   "Other/Delayed Non-Parkinsonian Neurologic Toxicity",
+                         # delayed_neuro_type = "Delayed Neurotoxicity Type",
+                         iec_hs_yn = "IEC-HS",
+                         
+                         ferritin_per200 = "Baseline Ferritin (scaled back 200)",
+
+                         cart_infusion_days_from_aph = "Time from apheresis to CAR-T infusion (days)",
+                         # total_dose_volume_m_l = "Total dose volume (mL)",
+                         cart_infusion_dose = "Total cell dose (million cells)",
+                         cart_cell_dose_cat = "Total cell dose (cat)",
+                         # best_ORRcollapsed = "Best ORR at ≤ 12 months",
+
+
+                         eligible_cartitude1 =
+                           "Did patient meet cartitude criteria"#,
+                         # best_response = "Best response in first 90 days"
+)
+
+```
+<br>
+
+# Exploratory analysis
+
+```{r infused}
+a <- data1 %>% 
+  mutate(has_infusion_date = case_when(
+    !is.na(cart_infusion_dt)          ~ "Yes",
+    is.na(cart_infusion_dt)           ~ "No"
+  )) %>% 
+  select(patientid, infused_status, has_infusion_date, cart_infusion_days_from_aph)
+
+cilta %>% 
+  distinct(patientid, .keep_all = TRUE) %>% 
+  # mutate(has_infusion_date = case_when(
+  #   !is.na(cart_infusion_dt)          ~ "Yes",
+  #   is.na(cart_infusion_dt)           ~ "No"
+  # )) %>% 
+  select(infused_status) %>% 
+  tbl_summary(missing = "no") %>% 
+  bold_labels() %>% add_stat_label()
+```
+
+
+```{r limit to infused patient, echo = TRUE, class.source= 'fold-hide'}
+cilta <- cilta %>% 
+  filter(infused_status == "Infused")
+```
+
+## We have `r nrow(cilta)` infused patients
+
+
+<!-- Verify CRS outcome classification -->
+<!-- ```{r} -->
+<!-- cilta %>%  -->
+<!--   distinct(patientid, .keep_all = TRUE) %>%  -->
+<!--   select(max_crs_grd,  -->
+<!--          crs_duration_days, crs_outcome,  -->
+<!--          crs_outcome_detailled, max_icans_grd,  -->
+<!--          iec_hs_yn, updated_death_cause) %>%  -->
+<!--   tbl_summary(by = crs_outcome_detailled, -->
+<!--               statistic=list(all_continuous() ~ "{median} ({min}, {max})")) %>%  -->
+<!--   bold_labels() -->
+<!-- ``` -->
+
+<!-- Verify True EMD -->
+<!-- ```{r} -->
+<!-- cilta %>%  -->
+<!--   select(true_emd, -->
+<!--          extramedu_yn, medhx_paraskeletal_yn) %>%  -->
+<!--   mutate(true_emd = fct_explicit_na(true_emd)) %>%  -->
+<!--   tbl_summary(by = true_emd, -->
+<!--               type = list(all_dichotomous() ~ "categorical"), -->
+<!--               missing_text = "Unknown") %>%  -->
+<!--   bold_labels() %>%  -->
+<!--   modify_spanning_header(all_stat_cols() ~ "true_emd") -->
+
+<!-- cilta %>%  -->
+<!--   select(true_emd, -->
+<!--          extramedu_yn, medhx_paraskeletal_yn) %>%  -->
+<!--   mutate(extramedu_yn = fct_explicit_na(extramedu_yn)) %>%  -->
+<!--   tbl_summary(by = extramedu_yn, -->
+<!--               type = list(all_dichotomous() ~ "categorical"), -->
+<!--               missing_text = "Unknown") %>%  -->
+<!--   bold_labels() %>%  -->
+<!--   modify_spanning_header(all_stat_cols() ~ "extramedu_yn") -->
+<!-- ``` -->
+<!-- 2 missing Extramedullary disease coded as missing for True EMD. 1 Yes Extramedullary disease is unknown for paraskeletal so coded as missing for True EMD. -->
+
+```{r}
+# cilta %>% 
+#   select(Site) %>% 
+#   tbl_summary() %>% 
+#   bold_labels()
+```
+
+
+<!-- ## Patient characteristics for the full dataset -->
+```{r look at patient characteristics}
+# a <- cilta %>% select(patientid, bsln_bmpc, bsln_burden_ge50pct, bmpc_cat)
+# cilta %>%
+#   distinct(patientid, .keep_all = TRUE) %>%
+#   select(mo_os_from_infusion,
+#          age_cart, agecat, male_sex, sex,
+#          race_eth,
+#          ecog_apheresis, ecog_apheresis_cat,
+#          ecog_ld, ecog_at_ld_cat, ecog_ge_2,
+#          subtype, r_iss,
+#          true_emd,
+#          extramedu_yn, medhx_paraskeletal_yn,
+# 
+#          bsln_bmpc, bsln_burden_ge50pct, bmpc_cat,
+#          bsln_bmpc_cat25, bsln_bmpc_cat65,
+#          cytogenetics,
+#          deletion_17p_tp53, t_414_yn, t_1416_yn,
+#          copyalteration_1q21, deletion_1p32,
+#          priorBCMA,
+#          txhistory_priorbmca_list,
+#          bridging_yn,
+#          bridging_response, bridging_response_prbetter,
+#          prior_tx_lines, priortx_grp, prior_tx_cat,
+#          prior_other_therapy_yn,
+#          immuno, proteasome, dara, doubleref, tripleref, pentaref,
+#          condition_therapy,
+#          prior_auto_sct_yn, prior_allo_sct_yn,
+#          labs_bsln_crp, bsln_crp_cat05,
+#          labs_bsln_ferritin, ferritin_per200, bsln_ferr_cat400,
+#          medhx_amyloid_yn, medhx_pcl_yn,
+#          cart_infusion_dose, cart_cell_dose_cat,
+#          eligible_cartitude1,
+# 
+# 
+#          max_crs_grd,
+#          crs_duration_days,
+#          max_icans_grd,
+#          iec_hs_yn
+#          ) %>%
+#   tbl_summary(
+#     type = list(
+#       c(ecog_ge_2, bsln_burden_ge50pct,
+#         true_emd,
+#         extramedu_yn, medhx_paraskeletal_yn,
+#         cytogenetics,
+#         deletion_17p_tp53,
+#         t_414_yn,
+#         t_1416_yn, copyalteration_1q21,
+#         bridging_yn,
+#         priorBCMA, prior_other_therapy_yn,
+#         immuno, proteasome, dara, doubleref, tripleref, pentaref,
+#         medhx_amyloid_yn, medhx_pcl_yn,
+#         eligible_cartitude1,
+# 
+#         iec_hs_yn
+#         )
+#       ~"categorical"),
+#     statistic = list(all_continuous() ~ "{median} ({min}, {max})"),
+#     digits = all_continuous() ~ 1
+#   ) %>%
+#   bold_labels() %>% add_stat_label() %>%
+#   remove_footnote_header(columns = everything())
+```
+
+
+
+# Predictive modeling
+
+* Variables to consider:    
+  + Age (age_cart)
+  + Sex (sex)
+  + Race and ethnicity (race_eth)
+  + ECOG PS (ecog_ld, ecog_apheresis)
+  + R-ISS disease stage (r_iss)
+  + True EMD (extramed_yn)
+  + Marrow burden – bone marrow plasma cell % (analyze both continuous and categorical - bsln_bmpc, bmpc_cat)
+  + High-risk cytogenetics (any one of the del17p, t_414, t_1416 present, if missing some but no for others then = no, if missing all then missing)
+  + Bridging therapy + response to bridging therapy (bridging_yn, bridging_therapy, bridging_response)
+  + Penta-refractory status (pentaref)
+  + Number of prior lines of therapy (prior_tx_lines, priortx_grp – may need to collapse groups if “1-3” doesn’t have many patients in one of the outcome groups).
+  + Prior anti-BCMA therapy (prior_other_therapy_yn, txhistory_priorbmca_list)
+  + Baseline CRP (labs_bsln_crp)
+  + Baseline ferritin (labs_bsln_ferritin)
+
+
+```{r remove NA in outcome, echo = TRUE, class.source= 'fold-hide'}
+limited_cilta <- cilta %>% 
+  filter(!is.na(crs_outcome))
+```
+
+#### We have `r nrow(cilta)` infused patients with CRS outcome
+
+```{r create limited data}
+limited_cilta_with_ids <- limited_cilta %>% 
+  select(patientid,
+         age_cart, sex, 
+         race_eth,
+         ecog_at_ld_cat,
+         ecog_ge_2,
+         true_emd,
+         bsln_bmpc, bmpc_cat,
+         bsln_bmpc_cat25, bsln_bmpc_cat65,
+         cytogenetics,
+         bridging_yn, bridging_response_prbetter,
+         pentaref, 
+         prior_tx_lines, prior_tx_cat,
+         priorBCMA,
+         prior_other_therapy_yn,
+         labs_bsln_crp, bsln_crp_cat05,
+         labs_bsln_ferritin, bsln_ferr_cat400,
+         eligible_cartitude1, crs_outcome)
+limited_cilta <- limited_cilta_with_ids %>% 
+  select(-patientid)
+```
+
+## Look at missingness in the limited dataset (all patients with CRS outcome but limited to potential predictors)
+```{r}
+skimr::skim(limited_cilta)
+```
+
+```{r}
+library(naniar)
+
+vis_miss(limited_cilta)
+gg_miss_upset(limited_cilta, nsets = 15)
+
+gg_miss_fct(x = limited_cilta, fct = crs_outcome)
+```
+
+# Make complete case data
+```{r}
+limited_cilta <- limited_cilta %>% 
+  drop_na()
+limited_cilta_with_ids <- limited_cilta_with_ids %>% 
+  drop_na() %>% 
+  # work around as paste0(limited_cilta_with_ids$patientid, collapse = "|")
+  # remove more patients than planned
+  mutate(keep_in_data = "Yes")
+cilta <-
+  inner_join(cilta,
+             limited_cilta_with_ids %>% 
+               select(patientid, keep_in_data))
+```
+
+# Population description
+
+```{r}
+cilta %>% 
+  select(Site) %>% 
+  tbl_summary() %>% 
+  bold_labels()
+```
+
+## Table 1. Patient characteristics (overall population considered)
+```{r Table Patient characteristics}
+cilta %>% 
+  select(mo_os_from_infusion, 
+         age_cart, agecat, male_sex, sex, 
+         race_eth,
+         ecog_apheresis, ecog_apheresis_cat,
+         ecog_ld, ecog_at_ld_cat, ecog_ge_2,
+         subtype, r_iss,
+         true_emd,
+         extramedu_yn, medhx_paraskeletal_yn,
+         
+         bsln_bmpc, bmpc_cat, bsln_bmpc_cat25, bsln_bmpc_cat65,
+         cytogenetics, 
+         deletion_17p_tp53, t_414_yn, t_1416_yn, 
+         copyalteration_1q21, deletion_1p32,
+         priorBCMA, txhistory_priorbmca_list, 
+         bridging_yn, 
+         bridging_response, 
+         prior_tx_lines, priortx_grp, prior_other_therapy_yn,
+         immuno, proteasome, dara, doubleref, tripleref, pentaref, 
+         condition_therapy,
+         # prior_auto_sct_yn, prior_allo_sct_yn,
+         labs_bsln_crp, labs_bsln_ferritin,
+         medhx_amyloid_yn, medhx_pcl_yn,
+         cart_infusion_dose, cart_cell_dose_cat, 
+         eligible_cartitude1, 
+         crs_outcome
+         ) %>% 
+  tbl_summary(by = crs_outcome,
+    type = list(
+      c(ecog_ge_2,
+        true_emd,
+        cytogenetics,
+        deletion_17p_tp53,
+        t_414_yn,
+        t_1416_yn, copyalteration_1q21,
+        bridging_yn,
+        priorBCMA,
+        immuno, proteasome, dara, doubleref, tripleref, pentaref,
+        medhx_amyloid_yn, medhx_pcl_yn,
+        eligible_cartitude1
+        )
+      ~"categorical"),
+    statistic = list(all_continuous() ~ "{median} ({min}, {max})"), 
+    digits = all_continuous() ~ 1
+  ) %>% 
+  bold_labels() %>% 
+  add_p() %>% bold_p(t = 0.05) %>% 
+  add_overall() %>% 
+  add_stat_label() %>% 
+  modify_spanning_header(all_stat_cols() ~ "CRS outcome") %>% 
+  remove_footnote_header(columns = everything())
+```
+
+## Table 2. Clinical outcomes
+```{r Table Clinical outcomes}
+cilta %>% 
+  select(max_crs_grd,
+         crs_duration_days, 
+         max_icans_grd,
+         iec_hs_yn,
+         other_neurotox_yn, parkinson_neurotox_yn, 
+         other_neurotox_cat, any_delay_neurotox_yn,
+         nrm, nrm_grp,
+         crs_outcome
+         ) %>% 
+  tbl_summary(by = crs_outcome,
+    type = list(
+      c(all_dichotomous()
+        )
+      ~"categorical"),
+    statistic = list(all_continuous() ~ "{median} ({min}, {max})"), 
+    digits = all_continuous() ~ 1
+  ) %>% 
+  bold_labels() %>% 
+  add_p() %>% bold_p(t = 0.05) %>% 
+  add_overall() %>% 
+  add_stat_label() %>% 
+  modify_spanning_header(all_stat_cols() ~ "CRS outcome") %>% 
+  remove_footnote_header(columns = everything())
+```
+
+Cause of death within nrm groups
+```{r}
+cilta %>% 
+  filter(nrm_grp %in% c("Acute toxicity", "Delayed toxicity")) %>% 
+  select(nrm_grp, updated_death_cause) %>% 
+  tbl_summary(by = nrm_grp) %>% 
+  bold_labels() %>% 
+  modify_spanning_header(all_stat_cols() ~ "NRM group")
+```
+
+
+## Table 3. Responses
+```{r Table Responses}
+cilta %>% 
+  select(day30_response, day30response, day30response_v2, day30response_MRD, 
+         mon3_response, mon3response, mon3response_v2, mon3response_MRD, 
+         mon6_response, mon6response, mon6response_v2, mon6response_MRD, 
+         mon9_response, mon9response, mon9response_v2, mon9response_MRD, 
+         mon12_response, mon12response, mon12response_v2, mon12response_MRD,
+         best_response, best_response_MRD,
+         best_ORR, best_CRorbetter,
+         crs_outcome
+         ) %>% 
+  tbl_summary(by = crs_outcome,
+    type = list(
+      c(all_dichotomous()
+        )
+      ~"categorical"),
+    statistic = list(all_continuous() ~ "{median} ({min}, {max})"), 
+    digits = all_continuous() ~ 1
+  ) %>% 
+  bold_labels() %>% 
+  add_p() %>% bold_p(t = 0.05) %>% 
+  add_overall() %>% 
+  add_stat_label() %>% 
+  modify_spanning_header(all_stat_cols() ~ "Responses") %>% 
+  remove_footnote_header(columns = everything())
+```
+
+## Survival
+### OS
+Median OS
+```{r}
+survfit(Surv(mo_os_from_infusion, os_event) ~ 1, data = cilta)
+survfit(Surv(mo_os_from_infusion, os_event) ~ crs_outcome, data = cilta)
+```
+
+
+```{r Survival analysis - KM by crs_outcome}
+ggsurvplot(survfit(Surv(mo_os_from_infusion, os_event) ~ crs_outcome,
+                   data = cilta),
+           # title = "PFS Analysis",
+           font.main = c(20, "bold", "black"),
+           font.x = c(15, "bold", "black"),
+           font.y = c(15, "bold", "black"),
+           font.legend = c(14, "black"),
+           font.tickslab = c(12, "bold", "black"),
+           size = 1.5,
+
+           xlab = "Time (months)",
+           ylab = "OS (probability)",
+           legend = "top",
+           legend.title = "crs_outcome", #legend.labs = c("No", "Yes"),
+           pval = TRUE,
+           conf.int = FALSE,
+           # Censor
+           censor = TRUE,
+           # risk.table = TRUE, risk.table.y.text = TRUE,
+           tables.theme = theme_survminer(#base_size = 5,
+                                          font.main = c(14, "bold", "black"),
+                                          # font.x = c(10, "bold", "black"),
+                                          # font.y = c(16, "bold", "transparent"),
+                                          # font.tickslab = c(19, "bold", "black")
+                                          )
+) %++% guides(colour = guide_legend(nrow = 1))
+
+coxph(Surv(time = cilta$mo_os_from_infusion,
+                   event = cilta$os_event) ~ crs_outcome,
+              data = cilta)  %>%
+  tbl_regression(exponentiate = TRUE) %>%
+  bold_p(t = .05) %>%
+  add_nevent(location = "level") %>% add_n(location = "level") %>% as_gt()
+```
+
+### PFS
+Median PFS
+```{r}
+survfit(Surv(mo_pfs_from_infusion, pfs_event) ~ 1, data = cilta)
+survfit(Surv(mo_pfs_from_infusion, pfs_event) ~ crs_outcome, data = cilta)
+```
+
+```{r PFS analysis - KM by crs_outcome}
+ggsurvplot(survfit(Surv(mo_pfs_from_infusion, pfs_event) ~ crs_outcome,
+                   data = cilta),
+           # title = "PFS Analysis",
+           font.main = c(20, "bold", "black"),
+           font.x = c(15, "bold", "black"),
+           font.y = c(15, "bold", "black"),
+           font.legend = c(14, "black"),
+           font.tickslab = c(12, "bold", "black"),
+           size = 1.5,
+
+           xlab = "Time (months)",
+           ylab = "PSS (probability)",
+           legend = "top",
+           legend.title = "crs_outcome", #legend.labs = c("No", "Yes"),
+           pval = TRUE,
+           conf.int = FALSE,
+           # Censor
+           censor = TRUE,
+           # risk.table = TRUE, risk.table.y.text = TRUE,
+           tables.theme = theme_survminer(#base_size = 5,
+                                          font.main = c(14, "bold", "black"),
+                                          # font.x = c(10, "bold", "black"),
+                                          # font.y = c(16, "bold", "transparent"),
+                                          # font.tickslab = c(19, "bold", "black")
+                                          )
+) %++% guides(colour = guide_legend(nrow = 1))
+
+coxph(Surv(time = cilta$mo_pfs_from_infusion,
+                   event = cilta$pfs_event) ~ crs_outcome,
+              data = cilta)  %>%
+  tbl_regression(exponentiate = TRUE) %>%
+  bold_p(t = .05) %>%
+  add_nevent(location = "level") %>% add_n(location = "level")
+```
+
+## HR
+```{r}
+coxph(Surv(time = cilta$mo_os_from_infusion,
+                   event = cilta$os_event) ~ crs_outcome + cytogenetics +
+        bridging_response_prbetter,
+              data = cilta)  %>%
+  tbl_regression(exponentiate = TRUE) %>%
+  bold_p(t = .05) %>%
+  add_nevent(location = "level") %>% add_n(location = "level") %>%
+  modify_spanning_header(everything() ~ "**MVA OS**") %>% as_gt()
+
+
+coxph(Surv(time = cilta$mo_pfs_from_infusion,
+                   event = cilta$pfs_event) ~ crs_outcome + cytogenetics +
+        bridging_response_prbetter,
+              data = cilta)  %>%
+  tbl_regression(exponentiate = TRUE) %>%
+  bold_p(t = .05) %>%
+  add_nevent(location = "level") %>% add_n(location = "level") %>%
+  modify_spanning_header(everything() ~ "**MVA PFS**")
+```
+
+# Create the train/test datasets on complete case data
+
+```{r training testing sets, echo = TRUE, class.source= 'fold-hide'}
+# Train/test split balanced for multiple factors
+balance <- c("crs_outcome")
+set.seed(1234)
+data_split_term <- multi_strata(limited_cilta[ ,balance], strategy= "interaction") 
+
+index.split <- splitTools::partition(data_split_term, p = c(train=0.8, test=0.2))
+training_set <- limited_cilta[index.split$train, ]
+testing_set <- limited_cilta[index.split$test, ]
+```
+
+#### `r nrow(training_set)` are include in the training set while `r nrow(testing_set)` are include in the testing set.    
+
+```{r training and testing table}
+training_set %>% 
+  mutate(data = "Training") %>% 
+  bind_rows(., testing_set %>% 
+  mutate(data = "Testing")) %>% 
+  tbl_summary(by = data,
+              type = list(all_dichotomous() ~ "categorical")) %>% 
+  bold_labels() %>% 
+  add_p() %>% bold_p(t = 0.05) %>% 
+  add_overall() %>% 
+  add_stat_label() %>% 
+  remove_footnote_header(columns = everything())
+```
+
+
+# Univariate logistic regression for each predictor on limited training data
+```{r prelim logit, echo = TRUE, class.source= 'fold-hide'}
+training_set <- training_set %>% 
+  mutate(crs_outcome_glm = case_when(
+    crs_outcome == "Severe - 0"      ~ "0",
+    crs_outcome == "Low - 1"         ~ "1"
+  ), crs_outcome_glm = factor(crs_outcome_glm, levels = c("0", "1"))) %>% 
+  select(-crs_outcome)
+
+tbl_uvregression(
+  training_set,
+  method = glm,
+  y = crs_outcome_glm,
+  method.args = list(family = binomial),
+  exponentiate = TRUE,
+  # include = -c("patientid"),
+  pvalue_fun = label_style_pvalue(digits = 2)
+  ) %>%
+  bold_p(t = .15) %>%
+  add_nevent(location = "level") %>% add_n(location = "level") %>%
+  bold_labels() %>% italicize_levels()
+```
+The next step is to apply a stepwise regression.   
+
+Brett ->	Limit potential predictors to those with univariate p-value < 0.15 and missingness < 20%.   
+Brett ->	Stepwise regression is done on categorical variables only
+
+
+# Stepwise Regression
+
+Following the above rule, these variables are excluded from the stepwise regression :    
+
+age_cart    
+Sex    
+Race and ethnicity   
+True EMD    
+Bridging response (detailled)    
+Number of prior regimens    
+Number of prior regimens (cat)    
+Prior BCMA-directed therapy    
+Prior other therapy    
+Did patient meet cartitude criteria    
+
+Variables included:   
+ecog_at_ld_cat   
+ecog_ge_2 (removed as is redundant)    
+bsln_bmpc ====>>>>>>> bsln_bmpc_cat25    
+cytogenetics    
+Bridging response (PR or better)    
+Penta refractory    
+Baseline CRP categorical    
+Baseline Ferritin categorical   
+
+Note:    
+Include `cytogenetics` instead of R-ISS.   
+
+
+```{r remove excluded var with higher p val, echo = TRUE, class.source= 'fold-hide'}
+training_set <- training_set %>% 
+  select(ecog_at_ld_cat,
+         bsln_bmpc_cat25,
+         # bsln_bmpc_cat65,
+         # bsln_bmpc, 
+         # bmpc_cat,
+         cytogenetics,
+         bridging_response_prbetter,
+         pentaref, 
+         bsln_crp_cat05,
+         # labs_bsln_crp,
+         # labs_bsln_ferritin, 
+         bsln_ferr_cat400,
+         crs_outcome_glm)
+
+testing_set <- testing_set %>% 
+  mutate(crs_outcome_glm = case_when(
+    crs_outcome == "Severe - 0"      ~ "0",
+    crs_outcome == "Low - 1"         ~ "1"
+  ), crs_outcome_glm = factor(crs_outcome_glm, levels = c("0", "1"))) %>% 
+  select(-crs_outcome) %>% 
+  select(ecog_at_ld_cat,
+         bsln_bmpc_cat25,
+         # bsln_bmpc_cat65,
+         # bsln_bmpc, 
+         # bmpc_cat,
+         cytogenetics,
+         bridging_response_prbetter,
+         pentaref, 
+         bsln_crp_cat05,
+         # labs_bsln_crp,
+         # labs_bsln_ferritin, 
+         bsln_ferr_cat400,
+         crs_outcome_glm)
+```
+
+
+```{r}
+# Do the same outcome coding for the main data but keeping all var
+# cilta <- cilta %>% 
+#   mutate(crs_outcome_glm = case_when(
+#     crs_outcome == "Severe - 0"      ~ "0",
+#     crs_outcome == "Low - 1"         ~ "1"
+#   ), crs_outcome_glm = factor(crs_outcome_glm, levels = c("0", "1")))
+
+# training_set <- training_set %>% 
+#   mutate(crs_outcome_glm = case_when(
+#     crs_outcome == "Severe - 0"      ~ "0",
+#     crs_outcome == "Low - 1"         ~ "1"
+#   ), crs_outcome_glm = factor(crs_outcome_glm, levels = c("0", "1")))
+# 
+# testing_set <- testing_set %>% 
+#   mutate(crs_outcome_glm = case_when(
+#     crs_outcome == "Severe - 0"      ~ "0",
+#     crs_outcome == "Low - 1"         ~ "1"
+#   ), crs_outcome_glm = factor(crs_outcome_glm, levels = c("0", "1")))
+```
+
+
+## Actual stepwise regression / complete case
+<!-- AIC: AIC works by penalizing the inclusion of additional variables in a model. The lower the AIC, the better performance of the model. AIC does not include sample size in penalty calculation, and it is optimal in minimizing the mean square error of predictions -->
+```{r stepreg complete case, fig.height=9, echo = TRUE, class.source= 'fold-hide'}
+traini <- training_set %>% as.data.frame()
+formula <- crs_outcome_glm ~ .
+set.seed(1234)
+res_complete_case <-
+  stepwise(formula = formula,
+           data = traini,
+           type = "logit",
+           # include = "pentaref",
+           strategy = "bidirection",
+           metric = c("AIC", "SL"),
+           sle=0.90,   #enters all since we already limited based on UVA
+           sls=0.15)    # stays if pvalue < 0.10
+res_complete_case
+summary(res_complete_case$bidirection$AIC)
+
+# plot_list <- setNames(
+#   lapply(c("bidirection"),function(i){
+#     setNames(
+#       lapply(c("details","overview"),function(j){
+#         plot(res_complete_case,strategy=i,process=j)
+#     }),
+#     c("details","overview")
+#     )
+#   }),
+#   c("bidirection")
+# )
+# 
+# cowplot::plot_grid(plotlist = plot_list$bidirection, ncol = 1, rel_heights = c(2, 1))
+
+report(res_complete_case, report_name = paste0(here::here(), "/Rmd/stepwise_report_no_missing", today()), format = "html")
+```
+Using the `r res_complete_case[["performance"]][["strategy:metric"]][1]` strategy, the voted model is   
+`r res_complete_case[["performance"]][["model"]][1]`.   
+
+
+
+
+
+## Modeling
+### Using complete cases data 
+```{r, echo = TRUE, class.source= 'fold-hide'}
+model_term <- res_complete_case[["performance"]][["model"]][1]
+```
+The final model is `r model_term`
+
+#### Final modeling on complete case training
+
+##### Training set performance
+Below is the multivariate model results for this model
+```{r multivariate model results for model with complete cases, echo = TRUE, class.source= 'fold-hide'}
+set.seed(1234)
+model_glm <- 
+  glm(model_term, 
+      data = training_set, 
+      family = "binomial")
+
+model_glm %>% 
+  tbl_regression(exponentiate=TRUE) %>% 
+  bold_labels() %>% 
+  bold_p(t = .05) %>% 
+  add_nevent(location = "level") %>% add_n(location = "level") %>% 
+  modify_caption("**Multivariate Model to identify low-risk CAR T patients - Retaining Suggestive Variables for AIC**")
+```
+
+```{r training roc complete cases, echo = TRUE, class.source= 'fold-hide'}
+set.seed(1234)
+train_prob <- 
+  predict(model_glm, newdata = training_set, type = "response")
+train_roc <- 
+  roc(training_set$crs_outcome_glm ~ train_prob, plot = TRUE, print.auc = TRUE)
+
+as.numeric(train_roc$auc)
+```
+
+
+```{r training complete cases, echo = TRUE, class.source= 'fold-hide'}
+truth = training_set$crs_outcome_glm
+
+pred = ifelse(train_prob > 0.5, "1", "0")
+
+# calc_class_err = function(actual, predicted) {
+#   mean(actual != predicted)
+# }
+# calc_class_err(actual = a$truth, predicted = model_glm_pred)
+
+train_tab = table(predicted = pred, actual = truth)
+train_con_mat = confusionMatrix(train_tab, positive = "1")
+c(train_con_mat$overall["Accuracy"],
+  train_con_mat$byClass["Sensitivity"],
+  train_con_mat$byClass["Specificity"])
+```
+
+```{r}
+conf_tab <- train_tab / rowSums(train_tab)
+conf_tab <- as.data.frame(conf_tab, stringsAsFactors = TRUE)
+conf_tab$actual <- factor(conf_tab$actual, rev(levels(conf_tab$actual)))
+
+ggplot(conf_tab, aes(predicted, actual, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = scales::percent(Freq)), size = 3) +
+  scale_fill_gradient(low = "white", high = "#3575b5")+
+  labs(x = "Expected", y = "Predicted", 
+       fill = "Overlap")+
+  theme_classic()+
+  theme(legend.position = "bottom")
+```
+
+
+##### Testing set performance
+```{r pred complete cases, echo = TRUE, class.source= 'fold-hide'}
+test_prob <- 
+  predict(model_glm, newdata = testing_set, type = "response")
+test_roc <- 
+  roc(testing_set$crs_outcome_glm ~ test_prob, plot = TRUE, print.auc = TRUE)
+
+as.numeric(test_roc$auc)
+```
+
+```{r, echo = TRUE, class.source= 'fold-hide'}
+truth = testing_set$crs_outcome_glm
+
+pred = ifelse(predict(model_glm, newdata = testing_set, type = "response") > 0.5, "1", "0")
+
+# calc_class_err = function(actual, predicted) {
+#   mean(actual != predicted)
+# }
+# calc_class_err(actual = a$truth, predicted = model_glm_pred)
+
+test_tab = table(predicted = pred, actual = truth)
+library(caret)
+test_con_mat = confusionMatrix(test_tab, positive = "1")
+c(test_con_mat$overall["Accuracy"],
+  test_con_mat$byClass["Sensitivity"],
+  test_con_mat$byClass["Specificity"])
+```
+
+```{r}
+conf_tab <- test_tab / rowSums(test_tab)
+conf_tab <- as.data.frame(conf_tab, stringsAsFactors = TRUE)
+conf_tab$actual <- factor(conf_tab$actual, rev(levels(conf_tab$actual)))
+
+ggplot(conf_tab, aes(predicted, actual, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = scales::percent(Freq)), size = 3) +
+  scale_fill_gradient(low = "white", high = "#3575b5")+
+  labs(x = "Expected", y = "Predicted", 
+       fill = "Overlap")+
+  theme_classic()+
+  theme(legend.position = "bottom")
+```
+
+
+
+
