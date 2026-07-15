@@ -422,7 +422,63 @@ data2 <- data2 %>%
     labs_bsln_crp < 0.5          ~ "bsln_ferr < 0.5",
     labs_bsln_crp >= 0.5         ~ "bsln_ferr ≥ 0.5"
   )) %>% 
-  mutate(ferritin_per200 = labs_bsln_ferritin / 200)
+  mutate(ferritin_per200 = labs_bsln_ferritin / 200) %>% 
+  mutate(cytopenia_preld = case_when(
+    labs_anc_preld < 1.8 | 
+      labs_hgb_preld < 11.4 | 
+      labs_platelets_preld < 143                                ~ "Yes",
+    is.na(labs_anc_preld) |
+      is.na(labs_platelets_preld) |
+      is.na(labs_hgb_preld)                               ~ NA_character_,
+    TRUE                                                        ~ "No"
+  )) %>% 
+  mutate(gr3_cytopenia_preld = case_when(
+    labs_anc_preld < 1 | 
+      labs_hgb_preld < 8 | 
+      labs_platelets_preld < 50                                        ~ "Yes",
+    is.na(labs_anc_preld) |
+      is.na(labs_platelets_preld) |
+      is.na(labs_hgb_preld)                                      ~ NA_character_,
+    TRUE                                                        ~ "No"
+  )) %>% 
+  
+  
+  mutate(cytopenia_d30 = case_when(
+    labs_anc_d30 < 1.8 | 
+      labs_hgb_d30 < 11.4 | 
+      labs_platelets_d30 < 143                                ~ "Yes",
+    is.na(labs_anc_d30) |
+      is.na(labs_platelets_d30) |
+      is.na(labs_hgb_d30)                               ~ NA_character_,
+    TRUE                                                        ~ "No"
+  )) %>% 
+  mutate(gr3_cytopenia_d30 = case_when(
+    labs_anc_d30 < 1 | 
+      labs_hgb_d30 < 8 | 
+      labs_platelets_d30 < 50                                        ~ "Yes",
+    is.na(labs_anc_d30) |
+      is.na(labs_platelets_d30) |
+      is.na(labs_hgb_d30)                                      ~ NA_character_,
+    TRUE                                                        ~ "No"
+  )) %>% 
+  mutate(cytopenia_d90 = case_when(
+    labs_anc_d90 < 1.8 | 
+      labs_hbg_d90 < 11.4 | 
+      labs_platelets_d90 < 143                                ~ "Yes",
+    is.na(labs_anc_d90) |
+      is.na(labs_platelets_d90) |
+      is.na(labs_hbg_d90)                               ~ NA_character_,
+    TRUE                                                        ~ "No"
+  )) %>% 
+  mutate(gr3_cytopenia_d90 = case_when(
+    labs_anc_d90 < 1 | 
+      labs_hbg_d90 < 8 | 
+      labs_platelets_d90 < 50                                        ~ "Yes",
+    is.na(labs_anc_d90) |
+      is.na(labs_platelets_d90) |
+      is.na(labs_hbg_d90)                                      ~ NA_character_,
+    TRUE                                                        ~ "No"
+  ))
 ```
 
 ```{r EMD}
@@ -459,6 +515,13 @@ var_label(cilta) <- list(age_cart = "Patient age", agecat = "Patient age - Categ
                          t_414_yn = "t(4:14) at Infusion",
                          t_1416_yn = "t(4:16) at Infusion",
                          copyalteration_1q21 = "Gain/amp 1q21",
+                         cytopenia_preld = "Cytopenia at pre LD",
+                         gr3_cytopenia_preld = "Grade3 cytopenia at pre LD",
+                         cytopenia_d30 = "Cytopenia at day30",
+                         gr3_cytopenia_d30 = "Grade3 cytopenia at day30",
+                         cytopenia_d90 = "Cytopenia at day90",
+                         gr3_cytopenia_d90 = "Grade3 cytopenia at day90",
+                         
                          # number_of_prior_lines_of_therapy = "Number of prior lines of therapy",
                          # number_prior_lines_therapy = "Number of prior lines of therapy (cat)",
                          prior_other_therapy_yn = "Prior other therapy",
@@ -703,6 +766,7 @@ limited_cilta_with_ids <- limited_cilta %>%
          prior_tx_lines, prior_tx_cat,
          priorBCMA,
          prior_other_therapy_yn,
+         # cytopenia_preld,
          labs_bsln_crp, bsln_crp_cat05,
          labs_bsln_ferritin, bsln_ferr_cat400,
          eligible_cartitude1, crs_outcome)
@@ -752,44 +816,47 @@ cilta %>%
 ```{r Table Patient characteristics}
 cilta %>% 
   select(mo_os_from_infusion, 
-         age_cart, agecat, male_sex, sex, 
+         age_cart, agecat, male_sex, sex,
          race_eth,
          ecog_apheresis, ecog_apheresis_cat,
          ecog_ld, ecog_at_ld_cat, ecog_ge_2,
          subtype, r_iss,
          true_emd,
          extramedu_yn, medhx_paraskeletal_yn,
-         
+
          bsln_bmpc, bmpc_cat, bsln_bmpc_cat25, bsln_bmpc_cat65,
-         cytogenetics, 
-         deletion_17p_tp53, t_414_yn, t_1416_yn, 
+         cytogenetics,
+         deletion_17p_tp53, t_414_yn, t_1416_yn,
          copyalteration_1q21, deletion_1p32,
-         priorBCMA, txhistory_priorbmca_list, 
-         bridging_yn, 
-         bridging_response, 
+         priorBCMA, txhistory_priorbmca_list,
+         bridging_yn,
+         bridging_response,
          prior_tx_lines, priortx_grp, prior_other_therapy_yn,
-         immuno, proteasome, dara, doubleref, tripleref, pentaref, 
+         immuno, proteasome, dara, doubleref, tripleref, pentaref,
          condition_therapy,
-         # prior_auto_sct_yn, prior_allo_sct_yn,
+         prior_auto_sct_yn, prior_allo_sct_yn,
+         cytopenia_preld, gr3_cytopenia_preld,
+         cytopenia_d30, gr3_cytopenia_d30,
+         cytopenia_d90, gr3_cytopenia_d90,
          labs_bsln_crp, labs_bsln_ferritin,
          medhx_amyloid_yn, medhx_pcl_yn,
-         cart_infusion_dose, cart_cell_dose_cat, 
-         eligible_cartitude1, 
+         cart_infusion_dose, cart_cell_dose_cat,
+         eligible_cartitude1,
          crs_outcome
          ) %>% 
   tbl_summary(by = crs_outcome,
     type = list(
-      c(ecog_ge_2,
-        true_emd,
-        cytogenetics,
-        deletion_17p_tp53,
-        t_414_yn,
-        t_1416_yn, copyalteration_1q21,
-        bridging_yn,
-        priorBCMA,
-        immuno, proteasome, dara, doubleref, tripleref, pentaref,
-        medhx_amyloid_yn, medhx_pcl_yn,
-        eligible_cartitude1
+      c(all_dichotomous()#ecog_ge_2,
+        # true_emd,
+        # cytogenetics,
+        # deletion_17p_tp53,
+        # t_414_yn,
+        # t_1416_yn, copyalteration_1q21,
+        # bridging_yn,
+        # priorBCMA,
+        # immuno, proteasome, dara, doubleref, tripleref, pentaref,
+        # medhx_amyloid_yn, medhx_pcl_yn,
+        # eligible_cartitude1
         )
       ~"categorical"),
     statistic = list(all_continuous() ~ "{median} ({min}, {max})"), 
@@ -958,27 +1025,27 @@ coxph(Surv(time = cilta$mo_pfs_from_infusion,
   add_nevent(location = "level") %>% add_n(location = "level")
 ```
 
-## HR
-```{r}
-coxph(Surv(time = cilta$mo_os_from_infusion,
-                   event = cilta$os_event) ~ crs_outcome + cytogenetics +
-        bridging_response_prbetter,
-              data = cilta)  %>%
-  tbl_regression(exponentiate = TRUE) %>%
-  bold_p(t = .05) %>%
-  add_nevent(location = "level") %>% add_n(location = "level") %>%
-  modify_spanning_header(everything() ~ "**MVA OS**") %>% as_gt()
+<!-- ## HR -->
+<!-- ```{r} -->
+<!-- coxph(Surv(time = cilta$mo_os_from_infusion, -->
+<!--                    event = cilta$os_event) ~ crs_outcome + cytogenetics + -->
+<!--         bridging_response_prbetter, -->
+<!--               data = cilta)  %>% -->
+<!--   tbl_regression(exponentiate = TRUE) %>% -->
+<!--   bold_p(t = .05) %>% -->
+<!--   add_nevent(location = "level") %>% add_n(location = "level") %>% -->
+<!--   modify_spanning_header(everything() ~ "**MVA OS**") %>% as_gt() -->
 
 
-coxph(Surv(time = cilta$mo_pfs_from_infusion,
-                   event = cilta$pfs_event) ~ crs_outcome + cytogenetics +
-        bridging_response_prbetter,
-              data = cilta)  %>%
-  tbl_regression(exponentiate = TRUE) %>%
-  bold_p(t = .05) %>%
-  add_nevent(location = "level") %>% add_n(location = "level") %>%
-  modify_spanning_header(everything() ~ "**MVA PFS**")
-```
+<!-- coxph(Surv(time = cilta$mo_pfs_from_infusion, -->
+<!--                    event = cilta$pfs_event) ~ crs_outcome + cytogenetics + -->
+<!--         bridging_response_prbetter, -->
+<!--               data = cilta)  %>% -->
+<!--   tbl_regression(exponentiate = TRUE) %>% -->
+<!--   bold_p(t = .05) %>% -->
+<!--   add_nevent(location = "level") %>% add_n(location = "level") %>% -->
+<!--   modify_spanning_header(everything() ~ "**MVA PFS**") -->
+<!-- ``` -->
 
 # Create the train/test datasets on complete case data
 
@@ -1198,8 +1265,10 @@ model_glm %>%
 set.seed(1234)
 train_prob <- 
   predict(model_glm, newdata = training_set, type = "response")
+tiff("Figures/Train ROC_20260707.tiff", width = 6, height = 6, units = 'in', res = 300, type = "cairo", compression = 'lzw')
 train_roc <- 
   roc(training_set$crs_outcome_glm ~ train_prob, plot = TRUE, print.auc = TRUE)
+dev.off()
 
 as.numeric(train_roc$auc)
 ```
@@ -1235,6 +1304,12 @@ ggplot(conf_tab, aes(predicted, actual, fill = Freq)) +
        fill = "Overlap")+
   theme_classic()+
   theme(legend.position = "bottom")
+
+ggsave("Figures/Train confmetric_20260707.tiff",
+       dpi = 600, units = "in",
+       width = 6,
+       height = 6, compression = "lzw"
+       )
 ```
 
 
@@ -1242,8 +1317,10 @@ ggplot(conf_tab, aes(predicted, actual, fill = Freq)) +
 ```{r pred complete cases, echo = TRUE, class.source= 'fold-hide'}
 test_prob <- 
   predict(model_glm, newdata = testing_set, type = "response")
+tiff("Figures/Test ROC_20260707.tiff", width = 6, height = 6, units = 'in', res = 300, type = "cairo", compression = 'lzw')
 test_roc <- 
   roc(testing_set$crs_outcome_glm ~ test_prob, plot = TRUE, print.auc = TRUE)
+dev.off()
 
 as.numeric(test_roc$auc)
 ```
@@ -1279,7 +1356,184 @@ ggplot(conf_tab, aes(predicted, actual, fill = Freq)) +
        fill = "Overlap")+
   theme_classic()+
   theme(legend.position = "bottom")
+
+ggsave("Figures/Test confmetric_20260707.tiff",
+       dpi = 600, units = "in",
+       width = 6,
+       height = 6, compression = "lzw"
+       )
 ```
+
+
+## Survival with suggestive variables
+```{r}
+coxph(Surv(time = cilta$mo_os_from_infusion,
+                   event = cilta$os_event) ~ crs_outcome + bsln_bmpc_cat25,
+              data = cilta)  %>%
+  tbl_regression(exponentiate = TRUE) %>%
+  bold_p(t = .05) %>%
+  add_nevent(location = "level") %>% add_n(location = "level") %>%
+  modify_spanning_header(everything() ~ "**MVA OS**") %>% as_gt()
+
+coxph(Surv(time = cilta$mo_os_from_infusion,
+                   event = cilta$os_event) ~ crs_outcome + ecog_at_ld_cat,
+              data = cilta)  %>%
+  tbl_regression(exponentiate = TRUE) %>%
+  bold_p(t = .05) %>%
+  add_nevent(location = "level") %>% add_n(location = "level") %>%
+  modify_spanning_header(everything() ~ "**MVA OS**") %>% as_gt()
+
+coxph(Surv(time = cilta$mo_os_from_infusion,
+                   event = cilta$os_event) ~ crs_outcome + ecog_at_ld_cat +
+        pentaref,
+              data = cilta)  %>%
+  tbl_regression(exponentiate = TRUE) %>%
+  bold_p(t = .05) %>%
+  add_nevent(location = "level") %>% add_n(location = "level") %>%
+  modify_spanning_header(everything() ~ "**MVA OS**") %>% as_gt()
+
+coxph(Surv(time = cilta$mo_os_from_infusion,
+                   event = cilta$os_event) ~ crs_outcome + ecog_at_ld_cat +
+        bsln_crp_cat05,
+              data = cilta)  %>%
+  tbl_regression(exponentiate = TRUE) %>%
+  bold_p(t = .05) %>%
+  add_nevent(location = "level") %>% add_n(location = "level") %>%
+  modify_spanning_header(everything() ~ "**MVA OS**") %>% as_gt()
+
+coxph(Surv(time = cilta$mo_os_from_infusion,
+                   event = cilta$os_event) ~ crs_outcome + ecog_at_ld_cat +
+        cytogenetics,
+              data = cilta)  %>%
+  tbl_regression(exponentiate = TRUE) %>%
+  bold_p(t = .05) %>%
+  add_nevent(location = "level") %>% add_n(location = "level") %>%
+  modify_spanning_header(everything() ~ "**MVA OS**") %>% as_gt()
+
+coxph(Surv(time = cilta$mo_os_from_infusion,
+                   event = cilta$os_event) ~ crs_outcome + ecog_at_ld_cat +
+        cytogenetics + bsln_ferr_cat400,
+              data = cilta)  %>%
+  tbl_regression(exponentiate = TRUE) %>%
+  bold_p(t = .05) %>%
+  add_nevent(location = "level") %>% add_n(location = "level") %>%
+  modify_spanning_header(everything() ~ "**MVA OS**") %>% as_gt()
+
+coxph(Surv(time = cilta$mo_os_from_infusion,
+                   event = cilta$os_event) ~ crs_outcome + ecog_at_ld_cat +
+        cytogenetics + bsln_ferr_cat400 + bridging_response_prbetter,
+              data = cilta)  %>%
+  tbl_regression(exponentiate = TRUE) %>%
+  bold_p(t = .05) %>%
+  add_nevent(location = "level") %>% add_n(location = "level") %>%
+  modify_spanning_header(everything() ~ "**MVA OS**") %>% as_gt()
+```
+
+
+```{r}
+coxph(Surv(time = cilta$mo_pfs_from_infusion,
+                   event = cilta$pfs_event) ~ crs_outcome + bsln_bmpc_cat25,
+              data = cilta)  %>%
+  tbl_regression(exponentiate = TRUE) %>%
+  bold_p(t = .05) %>%
+  add_nevent(location = "level") %>% add_n(location = "level") %>%
+  modify_spanning_header(everything() ~ "**MVA PFS**") %>% as_gt()
+
+coxph(Surv(time = cilta$mo_pfs_from_infusion,
+                   event = cilta$pfs_event) ~ crs_outcome + bsln_bmpc_cat25 +
+      ecog_at_ld_cat,
+              data = cilta)  %>%
+  tbl_regression(exponentiate = TRUE) %>%
+  bold_p(t = .05) %>%
+  add_nevent(location = "level") %>% add_n(location = "level") %>%
+  modify_spanning_header(everything() ~ "**MVA PFS**") %>% as_gt()
+
+coxph(Surv(time = cilta$mo_pfs_from_infusion,
+                   event = cilta$pfs_event) ~ crs_outcome + bsln_bmpc_cat25 +
+        ecog_at_ld_cat +
+        pentaref,
+              data = cilta)  %>%
+  tbl_regression(exponentiate = TRUE) %>%
+  bold_p(t = .05) %>%
+  add_nevent(location = "level") %>% add_n(location = "level") %>%
+  modify_spanning_header(everything() ~ "**MVA PFS**") %>% as_gt()
+
+coxph(Surv(time = cilta$mo_pfs_from_infusion,
+                   event = cilta$pfs_event) ~ crs_outcome + bsln_bmpc_cat25 +
+        ecog_at_ld_cat +
+        pentaref + bsln_crp_cat05,
+              data = cilta)  %>%
+  tbl_regression(exponentiate = TRUE) %>%
+  bold_p(t = .05) %>%
+  add_nevent(location = "level") %>% add_n(location = "level") %>%
+  modify_spanning_header(everything() ~ "**MVA PFS**") %>% as_gt()
+
+coxph(Surv(time = cilta$mo_pfs_from_infusion,
+                   event = cilta$pfs_event) ~ crs_outcome + bsln_bmpc_cat25 +
+        ecog_at_ld_cat +
+        pentaref + cytogenetics,
+              data = cilta)  %>%
+  tbl_regression(exponentiate = TRUE) %>%
+  bold_p(t = .05) %>%
+  add_nevent(location = "level") %>% add_n(location = "level") %>%
+  modify_spanning_header(everything() ~ "**MVA PFS**") %>% as_gt()
+
+coxph(Surv(time = cilta$mo_pfs_from_infusion,
+                   event = cilta$pfs_event) ~ crs_outcome + 
+        ecog_at_ld_cat +
+        pentaref + cytogenetics + bsln_ferr_cat400,
+              data = cilta)  %>%
+  tbl_regression(exponentiate = TRUE) %>%
+  bold_p(t = .05) %>%
+  add_nevent(location = "level") %>% add_n(location = "level") %>%
+  modify_spanning_header(everything() ~ "**MVA PFS**") %>% as_gt()
+
+coxph(Surv(time = cilta$mo_pfs_from_infusion,
+                   event = cilta$pfs_event) ~ crs_outcome + ecog_at_ld_cat +
+        ecog_at_ld_cat +
+        pentaref + cytogenetics + bsln_ferr_cat400 + bridging_response_prbetter,
+              data = cilta)  %>%
+  tbl_regression(exponentiate = TRUE) %>%
+  bold_p(t = .05) %>%
+  add_nevent(location = "level") %>% add_n(location = "level") %>%
+  modify_spanning_header(everything() ~ "**MVA PFS**") %>% as_gt()
+
+
+
+
+
+```
+
+# NRM curves
+```{r}
+library(tidycmprsk)
+library(ggsurvfit)
+# fig_nrm <-
+  cuminc(Surv(os_time_from_infusion_months, nrm_response) ~ `t(11:14) at Infusion`, 
+         data=nrm_curves) %>% 
+  ggcuminc(size = 1)+
+  add_pvalue("annotation", size = 4,
+             x = 1, y = 0.15,
+             prepend_p = FALSE, caption = "p = {p.value}"
+             ) +
+  add_censor_mark()+
+  # add_risktable()+
+  # xlim(c(0,15))+
+  # ylim(c(0, 0.25)) +
+  # scale_y_continuous(limits = c(0, 0.25), 
+  #                    labels = scales::percent,  
+  #                    expand = c(0.01, 0) 
+  #                    )+
+  labs(color = "Risk",
+       x = "Time (months)",
+       y = "Cumulative incidence"
+  )+ 
+  # scale_color_manual(values=c("purple", "darkgrey"))+ 
+    theme_classic()+
+    theme(legend.position = 'top', 
+          legend.direction = "horizontal")
+```
+
 
 
 

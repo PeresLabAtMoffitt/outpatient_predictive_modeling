@@ -1,0 +1,1362 @@
+---
+title: "Complete case outpatient predictive modeling with bootstrap"
+author: "Christelle Colin-Leitzinger"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: false
+    theme: united
+    highlight: pygments
+    df_print: paged
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+<style type= "text/css">
+
+. figure {
+   margin-top: 25px;
+   margin-bottom: 100px;
+}
+
+table {
+    margin-top: 10px;
+    margin-bottom: 25px;
+}
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,
+                      warning = FALSE,
+                      message = FALSE,
+                      cache = FALSE,
+                      fig.align='center'
+                      )
+```
+
+```{r library}
+library(here)
+library(tidyverse)
+library(ggplot2)
+library(gtsummary)
+library(labelled)
+library(DescTools)
+library(survival)
+library(survminer)
+library(StepReg)
+library(caret)
+library(pROC)
+library(splitTools)
+theme_set(theme_classic())
+theme_gtsummary_compact()
+```
+
+```{r load}
+path_raw <- fs::path("","Volumes","Peres_Research", "Myeloma", "Consortium Data", "May 2025")
+path_save <- fs::path("","Volumes","Peres_Research", "Myeloma", "Analyses", "")
+
+load(paste0(#path_raw, 
+           here(), "/data",
+           "/Cleaned_Consortium_Datasets_31Jul2025.RData"))
+rm(combined_abecma, combined_iec, combined_aml)
+```
+
+This project aims to build a predictive model to identify low-risk CAR T patients that could be managed in the outpatient setting. I’ve provided some information on how to define the low-risk patients (the outcome) and potential predictors below.
+
+Outcome
+1 = patients with no CRS or grade 1 CRS, no ICANS, and no IEC-HS
+0 = patients with grade 2 or higher CRS, patients with any ICANS, and patients with IEC-HS
+
+
+```{r case cleaning}
+combined_cart <- combined_cart %>% 
+  # General
+  # Fix letter case
+  mutate(across(c(where(is.character),
+                  -c("patientid",
+                     "heavychain",
+                     "bridging_response",
+                     "r_iss", "updated_death_cause",
+                     "eligible_cartitude1_reason",
+                     contains("response"),
+                     starts_with("ORR_"),
+                     starts_with("CRorbetter")
+                     )),
+                ~ str_to_sentence(.) )) %>% 
+  mutate(across(c("updated_death_cause", "Site"), 
+                ~ str_to_lower(.)))
+```
+
+
+```{r general cleaning}
+data1 <- combined_cart %>% 
+  mutate(Site1 = str_replace_all(Site, " ", "_")) %>% 
+  unite(col = patientid, c(cart_dataset, patientid, Site1), 
+        sep = "-", 
+        remove = FALSE) %>% 
+  select(-Site1) %>% 
+  # Fix numerical
+  mutate_at(c("age_cart"
+                  ), 
+                ~ as.numeric(.)) %>%
+  # Sex categories
+  mutate(male_sex = case_when(
+    sex == "Male"                                    ~ 1,
+    sex == "Female"                                  ~ 0
+  )) %>% 
+  # ECOG
+  mutate(ecog_apheresis_cat = case_when(
+    ecog_apheresis == 0 |
+      ecog_apheresis == 1                            ~ "0-1",
+    ecog_apheresis %in% c(2:4)                       ~ "2-4"
+  ), .after = ecog_apheresis) %>%
+  mutate(ecog_at_ld_cat = case_when(
+    ecog_ld == 0 |
+      ecog_ld == 1                                   ~ "0-1",
+    ecog_ld %in% c(2:4)                              ~ "2-4"
+  ), .after = ecog_ld) %>%
+  mutate_at(c("ecog_apheresis", "ecog_ld"), ~ factor(.)) %>% 
+  # Cytogenetics ----
+  mutate(cytogenetics = case_when(
+    deletion_17p_tp53 == "Yes" | 
+      t_414_yn == "Yes" | 
+      t_1416_yn == "Yes"             ~ "Yes",
+    deletion_17p_tp53 == "No" &
+      t_414_yn == "No" &
+      t_1416_yn == "No"               ~ "No",
+    TRUE                                                           ~ NA_character_
+  ), .before = deletion_17p_tp53) 
+```
+
+```{r therapy}
+data1 <- data1 %>%
+  # CART dose
+  mutate(cart_infusion_dose = as.numeric(cart_infusion_dose)) %>% 
+  mutate(cart_cell_dose_cat = case_when(
+    cart_infusion_dose < 0.7                   ~ "< 0.7",
+    cart_infusion_dose >= 0.7                  ~ "≥ 0.7"
+  )) %>% 
+  mutate(prior_tx_cat = case_when(
+    prior_tx_lines <= 3                        ~ "1-3",
+    prior_tx_lines <= 5                        ~ "4-5",
+    prior_tx_lines >= 6                        ~ "≥6"
+  ), prior_tx_cat = factor(prior_tx_cat, levels = 
+                             c("1-3", "4-5", "≥6")
+  )) %>% 
+  mutate(condition_therapy = case_when(
+    str_detect(str_to_lower(condition_therapy), "flu") &
+      str_detect(str_to_lower(condition_therapy), "cy")       ~ "fludarabine + cytoxan",
+    str_detect(str_to_lower(condition_therapy), "clad") &
+      str_detect(str_to_lower(condition_therapy), "cy")       ~ "cladribine + cytoxan",
+    TRUE                                                      ~ str_to_lower(condition_therapy)
+  )) %>% 
+  mutate(txhistory_priorbmca_list = case_when(
+    txhistory_priorbmca_list == "None" |
+      txhistory_priorbmca_list == "No" |
+      txhistory_priorbmca_list == "N/a" |
+      txhistory_priorbmca_list == "Na"         ~ NA_character_,
+    TRUE                                       ~ txhistory_priorbmca_list
+  )) %>% 
+  # BCMA
+  mutate(prior_bcma_therapy = case_when(
+    !is.na(txhistory_priorbmca_list)           ~ "Yes",
+    str_detect(
+      str_to_upper(eligible_cartitude1_reason), 
+      "BCMA")                                  ~ "Yes",
+    str_detect(
+      str_to_upper(eligible_cartitude1_reason), 
+      "TECLISTAMAB")                           ~ "Yes",
+    str_detect(
+      str_to_upper(eligible_cartitude1_reason), 
+      "TALQ")                                  ~ "Yes",
+    
+    is.na(txhistory_priorbmca_list)            ~ "No"
+  )) %>% 
+  # Lauren's updated code
+  mutate(priorBCMA = case_when( # used a combination of prior therapy, bcma list, and ineligible for cartitude1 reason
+    is.na(prior_other_therapy_yn) ~ NA_character_,
+    str_detect(patientid, "Roswell28") ~ "No",
+    str_detect(patientid, "12") & Site == "michigan"  ~ "No",
+    prior_other_therapy_yn == "Yes" & txhistory_priorbmca_list == "Talquetamab" ~ "No",
+    prior_other_therapy_yn == "Yes" & txhistory_priorbmca_list == "talq" ~ "No",
+    prior_other_therapy_yn == "Yes" ~ "Yes",
+    prior_other_therapy_yn == "No" & txhistory_priorbmca_list == "Teclistimab" ~ "Yes",
+    prior_other_therapy_yn == "No" & txhistory_priorbmca_list == "Teneo biospeficic (TENIO 383B)" ~ "Yes",
+    prior_other_therapy_yn == "No" ~ "No"
+  )) %>% 
+
+  mutate(bridging_response_prbetter = case_when(
+    bridging_response == "Not Evaluable"       ~ NA_character_,
+    str_detect(bridging_response, "CR|PR")     ~ "PR or better",
+    bridging_yn == "No" & 
+      is.na(bridging_response)                 ~ "No bridging",
+    !is.na(bridging_response)                  ~ "< PR",
+    is.na(bridging_response)                   ~ NA_character_,
+    TRUE                                       ~ bridging_response
+  ), .after = bridging_response
+  ) %>% 
+  mutate(bridging_response_prbetter = factor(
+    bridging_response_prbetter, levels = c("No bridging", "< PR", "PR or better")
+  ))
+
+
+```
+
+```{r toxicities}
+data1 <- data1 %>% 
+  # CRS
+  # Remove NAs to duration and make as num
+  mutate(crs_duration_days = as.numeric(crs_duration_days)) %>% 
+  # Fix iec_hs_yn if updated_death_cause is HLH
+  mutate(iec_hs_yn = case_when(
+    # all HLH cause of death are not counted as iec, adding back
+    str_detect(updated_death_cause, "hlh")          ~ "Yes",
+    # not needed now but adding this line as warning for next update if it happens
+    str_detect(updated_death_cause, "iec")          ~ "Yes",
+    TRUE                                            ~ iec_hs_yn
+  )) %>% 
+  mutate(crs_outcome_detailled = case_when(
+         (max_crs_grd == 0 |
+            max_crs_grd == 1) &
+            (max_icans_grd == 0 &
+               iec_hs_yn == "No")                    ~ "Low - 1",
+         (max_crs_grd == 0 |
+            max_crs_grd == 1) &
+            (is.na(max_icans_grd) |
+               is.na(iec_hs_yn))                     ~ "no icans OR no iec data",
+         
+         (max_crs_grd == 0 |
+            max_crs_grd == 1) &
+            (max_icans_grd > 0 |
+               iec_hs_yn == "Yes")                   ~ "Severe - 0",
+         
+         # (max_crs_grd == 1 &
+         #   is.na(crs_duration_days)) &
+         #    (max_icans_grd > 0 &
+         #       iec_hs_yn == "Yes")                   ~ "Severe - 0",
+         
+         # (max_crs_grd == 1 &
+         #   is.na(crs_duration_days))                 ~ "CRS 1 but no duration",
+         
+         # (max_crs_grd == 1 &
+         #   crs_duration_days < 14) &
+         #    (max_icans_grd == 0 &
+         #       iec_hs_yn == "No")                    ~ "Low - 1",
+         
+         # (max_crs_grd == 1 &
+         #   crs_duration_days < 14) &
+         #    (is.na(max_icans_grd) |
+         #       is.na(iec_hs_yn))                     ~ "no icans OR no iec data",
+         
+         max_crs_grd %in% c(2:5)                     ~ "Severe - 0",
+         !is.na(max_crs_grd)                         ~ "check",
+         TRUE                                        ~ NA_character_
+       )) %>% 
+  mutate(crs_outcome = factor(crs_outcome_detailled, levels = c("Severe - 0", "Low - 1")))
+
+a <- data1 %>% select(patientid, max_crs_grd, crs_duration_days,crs_outcome, crs_outcome_detailled, max_icans_grd, iec_hs_yn, updated_death_cause)
+
+
+
+```
+
+```{r disease}
+data2 <- data1 %>%
+# Myeloma
+  mutate(oligo_nonsecretory_chris = case_when(
+    oligo_nonsecretory == "Non-secretory"        ~ "Yes",
+    oligo_nonsecretory == "Oligosecretory"       ~ "Yes",
+    TRUE                                             ~ oligo_nonsecretory
+  ))
+```
+
+```{r baseline}
+data2 <- data2 %>%
+  mutate(bsln_bmpc_cat25 = case_when(
+    bsln_bmpc < 25          ~ "bsln_bmpc < 25",
+    bsln_bmpc >= 25         ~ "bsln_bmpc ≥ 25"
+  )) %>% 
+  mutate(bsln_bmpc_cat65 = case_when(
+    bsln_bmpc < 65          ~ "bsln_bmpc < 65",
+    bsln_bmpc >= 65         ~ "bsln_bmpc ≥ 65"
+  )) %>% 
+#   mutate(labs_platelets_preld = 
+#            as.numeric(str_extract_all(labs_platelets_preld, "[[:digit:]]+"))
+#   )  %>% 
+  mutate(bsln_ferr_cat400 = case_when(
+    labs_bsln_ferritin < 400          ~ "bsln_ferr < 400",
+    labs_bsln_ferritin >= 400         ~ "bsln_ferr ≥ 400"
+  )) %>% 
+  mutate(bsln_crp_cat05 = case_when(
+    labs_bsln_crp < 0.5          ~ "bsln_crp < 0.5",
+    labs_bsln_crp >= 0.5         ~ "bsln_crp ≥ 0.5"
+  )) %>% 
+  mutate(ferritin_per200 = labs_bsln_ferritin / 200) %>% 
+  mutate(cytopenia_preld = case_when(
+    labs_anc_preld < 1.8 | 
+      labs_hgb_preld < 11.4 | 
+      labs_platelets_preld < 143                                ~ "Yes",
+    is.na(labs_anc_preld) |
+      is.na(labs_platelets_preld) |
+      is.na(labs_hgb_preld)                               ~ NA_character_,
+    TRUE                                                        ~ "No"
+  )) %>% 
+  mutate(gr3_cytopenia_preld = case_when(
+    labs_anc_preld < 1 | 
+      labs_hgb_preld < 8 | 
+      labs_platelets_preld < 50                                        ~ "Yes",
+    is.na(labs_anc_preld) |
+      is.na(labs_platelets_preld) |
+      is.na(labs_hgb_preld)                                      ~ NA_character_,
+    TRUE                                                        ~ "No"
+  )) %>% 
+  
+  
+  mutate(cytopenia_d30 = case_when(
+    labs_anc_d30 < 1.8 | 
+      labs_hgb_d30 < 11.4 | 
+      labs_platelets_d30 < 143                                ~ "Yes",
+    is.na(labs_anc_d30) |
+      is.na(labs_platelets_d30) |
+      is.na(labs_hgb_d30)                               ~ NA_character_,
+    TRUE                                                        ~ "No"
+  )) %>% 
+  mutate(gr3_cytopenia_d30 = case_when(
+    labs_anc_d30 < 1 | 
+      labs_hgb_d30 < 8 | 
+      labs_platelets_d30 < 50                                        ~ "Yes",
+    is.na(labs_anc_d30) |
+      is.na(labs_platelets_d30) |
+      is.na(labs_hgb_d30)                                      ~ NA_character_,
+    TRUE                                                        ~ "No"
+  )) %>% 
+  mutate(cytopenia_d90 = case_when(
+    labs_anc_d90 < 1.8 | 
+      labs_hbg_d90 < 11.4 | 
+      labs_platelets_d90 < 143                                ~ "Yes",
+    is.na(labs_anc_d90) |
+      is.na(labs_platelets_d90) |
+      is.na(labs_hbg_d90)                               ~ NA_character_,
+    TRUE                                                        ~ "No"
+  )) %>% 
+  mutate(gr3_cytopenia_d90 = case_when(
+    labs_anc_d90 < 1 | 
+      labs_hbg_d90 < 8 | 
+      labs_platelets_d90 < 50                                        ~ "Yes",
+    is.na(labs_anc_d90) |
+      is.na(labs_platelets_d90) |
+      is.na(labs_hbg_d90)                                      ~ NA_character_,
+    TRUE                                                        ~ "No"
+  ))
+```
+
+```{r EMD}
+cilta <- data2 %>% 
+  mutate(true_emd = case_when(
+    extramedu_yn == "Yes" & 
+      medhx_paraskeletal_yn == "No"              ~ "Yes", 
+    extramedu_yn == "Yes" & 
+      medhx_paraskeletal_yn == "Yes"             ~ "No",
+    extramedu_yn == "No"                         ~ "No", 
+    is.na(medhx_paraskeletal_yn)                 ~ NA_character_,
+    TRUE                                         ~ "check"
+  ))
+a <- cilta %>% select(patientid, extramedu_yn, medhx_paraskeletal_yn, true_emd)
+```
+
+
+```{r Labeling}
+# Labeling ----
+var_label(cilta) <- list(age_cart = "Patient age", agecat = "Patient age - Categories",
+                         male_sex = "Male Sex", sex = "Sex",
+                         race_eth = "Race and ethnicity",
+                         mo_os_from_infusion = "Follow-up time from infusion (months)",
+                         extramedu_yn = "Extramedullary disease",
+                         medhx_amyloid_yn = "Amyloidosis",
+                         medhx_pcl_yn = "Plasma cell leukemia",
+                         # circulating_plasma_cell = "UPDATED Circulating Plasma Cells",
+                         bsln_burden_ge50pct = "High marrow burden (≥50%)",
+                         ecog_ld = "ECOG at LD",
+                         # `ECOG > or = 2? (Yes, No)` ,
+                         r_iss = "R-ISS at cart infusion",
+                         cytogenetics = "High risk cytogenetics (not include gain 1q)",
+                         deletion_17p_tp53 = "Deletion 17p at Infusion",
+                         t_414_yn = "t(4:14) at Infusion",
+                         t_1416_yn = "t(4:16) at Infusion",
+                         copyalteration_1q21 = "Gain/amp 1q21",
+                         cytopenia_preld = "Cytopenia at pre LD",
+                         gr3_cytopenia_preld = "Grade3 cytopenia at pre LD",
+                         cytopenia_d30 = "Cytopenia at day30",
+                         gr3_cytopenia_d30 = "Grade3 cytopenia at day30",
+                         cytopenia_d90 = "Cytopenia at day90",
+                         gr3_cytopenia_d90 = "Grade3 cytopenia at day90",
+                         
+                         # number_of_prior_lines_of_therapy = "Number of prior lines of therapy",
+                         # number_prior_lines_therapy = "Number of prior lines of therapy (cat)",
+                         prior_other_therapy_yn = "Prior other therapy",
+                         bridging_yn = "Bridging therapy",
+                         bridging_response = "Bridging response (detailled)",
+                         bridging_response_prbetter = "Bridging response (PR or better)",
+                         prior_auto_sct_yn = "Prior autoSCT",
+                         prior_allo_sct_yn = "Prior alloSCT",
+                         prior_tx_cat = "Number of prior regimens (cat)",
+                         
+                         condition_therapy = "Lymphodepletion chemotherapy",
+                         priorBCMA = "Prior BCMA-directed therapy",
+                         # need_for_g_csf_post_infus_yes_1_no_0 = "Granulocyte colony stimulating factor (G-CSF)",
+                         # need_for_ivig_yes_1_no_0 = "Intravenous immunoglobulin (IVIG)",
+                         # cd34_stem_cell_boost_yes_1_no_0 = "CD34 stem cell boost",
+                         # tpo_agonist_post_cart_yes_1_no_0 = "Thrombopoietin (TPO) agonist",
+                         # bmicat = "BMI at apheresis - Normal, Overweight, Obese",
+                         # steroid_use_yes_no = "Steroid Use", tocilizumab_yes_no = "Tocilizumab Use",
+                         # anakinra_yes_no = "Anakinra Use",
+                         proteasome = "Refractory to Proteasome Inhibitors",
+                         # lenalidomide_exposed_vs_refractory_vs_not_exposed = "Refractory to Lenalidomide",
+                         # bortezomib_exposed_vs_refractory_vs_not_exposed = "Refractory to Bortezomib",
+                         # carfilzomib_exposed_vs_refractory_vs_not_exposed = "Refractory to Carfilzomib",
+                         # pomalidomide_exposed_vs_refractory_vs_not_exposed = "Refractory to Pomalidomide",
+                         dara = "Refractory to Daratumumab or Isatuximab",
+                         immuno = "Refractory to Immunomodulators", doubleref = "Double refractory",
+                         tripleref= "Triple refractory", pentaref= "Penta refractory",
+                         # bmicat2 = "BMI at apheresis - Normal vs. Overweight/Obese",
+                         CRS_any = "Any CRS", CRS_gradecat = "CRS Grade",
+                         ICANS_any = "Any ICANS", ICANS_gradecat = "ICANS Grade",
+                         # day_of_onset_crs_relative_to_infusion = "Day of onset of CRS relative to infusion",
+                         # day_of_max_crs_relative_to_infusion = "Day of Max CRS (relative to infusion)",
+                         crs_duration_days = "Duration of CRS (days)",
+                         # day_of_onset_icans_relative_to_infusion = "Day of onset of ICANS relative to infusion",
+                         # day_of_max_icans_relative_to_infusion = "Day of Max ICANS (relative to infusion)",
+                         icans_duration_days = "Duration of ICANS (days)",
+                         # delayed_neuro = "Delayed Neurotoxicity",
+                         # parkinsonian_neurotoxicity_yes_no = "Parkinsonian Neurotoxicity",
+                         # other_delayed_non_parkinsonian_neurologic_toxicity_yes_no =
+                         #   "Other/Delayed Non-Parkinsonian Neurologic Toxicity",
+                         # delayed_neuro_type = "Delayed Neurotoxicity Type",
+                         iec_hs_yn = "IEC-HS",
+                         
+                         ferritin_per200 = "Baseline Ferritin (scaled back 200)",
+
+                         cart_infusion_days_from_aph = "Time from apheresis to CAR-T infusion (days)",
+                         # total_dose_volume_m_l = "Total dose volume (mL)",
+                         cart_infusion_dose = "Total cell dose (million cells)",
+                         cart_cell_dose_cat = "Total cell dose (cat)",
+                         # best_ORRcollapsed = "Best ORR at ≤ 12 months",
+
+
+                         eligible_cartitude1 =
+                           "Did patient meet cartitude criteria"#,
+                         # best_response = "Best response in first 90 days"
+)
+
+```
+<br>
+
+<!-- # Exploratory analysis -->
+
+```{r infused}
+a <- data1 %>% 
+  mutate(has_infusion_date = case_when(
+    !is.na(cart_infusion_dt)          ~ "Yes",
+    is.na(cart_infusion_dt)           ~ "No"
+  )) %>% 
+  select(patientid, infused_status, has_infusion_date, cart_infusion_days_from_aph)
+
+cilta %>% 
+  distinct(patientid, .keep_all = TRUE) %>% 
+  # mutate(has_infusion_date = case_when(
+  #   !is.na(cart_infusion_dt)          ~ "Yes",
+  #   is.na(cart_infusion_dt)           ~ "No"
+  # )) %>% 
+  select(infused_status) %>% 
+  tbl_summary(missing = "no") %>% 
+  bold_labels() %>% add_stat_label()
+```
+
+
+```{r limit to infused patient}
+cilta <- cilta %>% 
+  filter(infused_status == "Infused")
+```
+
+<!-- ## We have `r nrow(cilta)` infused patients -->
+
+# Predictive modeling
+
+* Variables to consider:    
+  + Age (age_cart)
+  + Sex (sex)
+  + Race and ethnicity (race_eth)
+  + ECOG PS (ecog_ld, ecog_apheresis)
+  + R-ISS disease stage (r_iss)
+  + True EMD (extramed_yn)
+  + Marrow burden – bone marrow plasma cell % (analyze both continuous and categorical - bsln_bmpc, bmpc_cat)
+  + High-risk cytogenetics (any one of the del17p, t_414, t_1416 present, if missing some but no for others then = no, if missing all then missing)
+  + Bridging therapy + response to bridging therapy (bridging_yn, bridging_therapy, bridging_response)
+  + Penta-refractory status (pentaref)
+  + Number of prior lines of therapy (prior_tx_lines, priortx_grp – may need to collapse groups if “1-3” doesn’t have many patients in one of the outcome groups).
+  + Prior anti-BCMA therapy (prior_other_therapy_yn, txhistory_priorbmca_list)
+  + Baseline CRP (labs_bsln_crp)
+  + Baseline ferritin (labs_bsln_ferritin)
+
+
+```{r remove NA in outcome}
+limited_cilta <- cilta %>% 
+  filter(!is.na(crs_outcome))
+```
+
+<!-- #### We have `r nrow(cilta)` infused patients with CRS outcome -->
+
+```{r create limited data}
+limited_cilta_with_ids <- limited_cilta %>% 
+  select(patientid,
+         age_cart, sex, 
+         race_eth,
+         ecog_at_ld_cat,
+         ecog_ge_2,
+         true_emd,
+         bsln_bmpc, bmpc_cat,
+         bsln_bmpc_cat25, bsln_bmpc_cat65,
+         cytogenetics,
+         bridging_yn, bridging_response_prbetter,
+         pentaref, 
+         prior_tx_lines, prior_tx_cat,
+         priorBCMA,
+         prior_other_therapy_yn,
+         # cytopenia_preld,
+         labs_bsln_crp, bsln_crp_cat05,
+         labs_bsln_ferritin, bsln_ferr_cat400,
+         eligible_cartitude1, crs_outcome)
+limited_cilta <- limited_cilta_with_ids %>% 
+  select(-patientid)
+```
+
+# Complete case data
+```{r}
+limited_cilta <- limited_cilta %>% 
+  drop_na()
+limited_cilta_with_ids <- limited_cilta_with_ids %>% 
+  drop_na() %>% 
+  # work around as paste0(limited_cilta_with_ids$patientid, collapse = "|")
+  # remove more patients than planned
+  mutate(keep_in_data = "Yes")
+cilta <-
+  inner_join(cilta,
+             limited_cilta_with_ids %>% 
+               select(patientid, keep_in_data))
+```
+
+<!-- # Population description -->
+#### We have `r nrow(cilta)` infused patients with CRS outcome in the complete case dataset.
+
+```{r}
+cilta %>%
+  select(Site) %>%
+  tbl_summary() %>%
+  bold_labels()
+```
+
+## Table 1. Patient characteristics (overall population considered)
+```{r Table Patient characteristics}
+cilta %>%
+  select(#mo_os_from_infusion,
+         age_cart, agecat, 
+         male_sex, #sex,
+         race_eth,
+         # ecog_apheresis, ecog_apheresis_cat,
+         ecog_at_ld_cat, #ecog_ld, ecog_ge_2,
+         # subtype, r_iss,
+         true_emd,
+         # extramedu_yn, medhx_paraskeletal_yn,
+
+         bsln_bmpc, bsln_bmpc_cat25, #bmpc_cat, bsln_bmpc_cat65,
+         cytogenetics,
+         # deletion_17p_tp53, t_414_yn, t_1416_yn,
+         # copyalteration_1q21, deletion_1p32,
+         medhx_pcl_yn,# medhx_amyloid_yn, 
+         prior_tx_lines, #priortx_grp, #prior_other_therapy_yn,
+         # immuno, proteasome, dara, 
+         doubleref, tripleref, pentaref,
+         # prior_auto_sct_yn, prior_allo_sct_yn,
+         priorBCMA, #txhistory_priorbmca_list,
+         bridging_yn,
+         bridging_response_prbetter, #bridging_response, 
+         condition_therapy,
+         labs_bsln_crp, bsln_crp_cat05,
+         labs_bsln_ferritin, bsln_ferr_cat400,
+         cart_cell_dose_cat, #cart_infusion_dose, 
+         eligible_cartitude1,
+         crs_outcome
+         ) %>%
+  tbl_summary(by = crs_outcome,
+    type = list(
+      c(all_dichotomous()#ecog_ge_2,
+        # true_emd,
+        # cytogenetics,
+        # deletion_17p_tp53,
+        # t_414_yn,
+        # t_1416_yn, copyalteration_1q21,
+        # bridging_yn,
+        # priorBCMA,
+        # immuno, proteasome, dara, doubleref, tripleref, pentaref,
+        # medhx_amyloid_yn, medhx_pcl_yn,
+        # eligible_cartitude1
+        )
+      ~"categorical"),
+    statistic = list(all_continuous() ~ "{median} ({min}, {max})"),
+    digits = all_continuous() ~ 1
+  ) %>%
+  bold_labels() %>%
+  add_p() %>% bold_p(t = 0.05) %>%
+  # add_overall() %>%
+  add_stat_label() %>%
+  modify_spanning_header(all_stat_cols() ~ "CRS outcome") %>%
+  remove_footnote_header(columns = everything())
+```
+
+## Table 2. Clinical outcomes
+```{r Table Clinical outcomes}
+cilta %>%
+  select(max_crs_grd,
+         crs_duration_days,
+         max_icans_grd,
+         iec_hs_yn,
+         other_neurotox_yn, parkinson_neurotox_yn,
+         other_neurotox_cat, any_delay_neurotox_yn,
+         nrm, nrm_grp,
+         cytopenia_preld, gr3_cytopenia_preld,
+         cytopenia_d30, gr3_cytopenia_d30,
+         cytopenia_d90, gr3_cytopenia_d90,
+         crs_outcome
+         ) %>%
+  tbl_summary(by = crs_outcome,
+    type = list(
+      c(all_dichotomous()
+        )
+      ~"categorical"),
+    statistic = list(all_continuous() ~ "{median} ({min}, {max})"),
+    digits = all_continuous() ~ 1
+  ) %>%
+  bold_labels() %>%
+  add_p() %>% bold_p(t = 0.05) %>%
+  # add_overall() %>%
+  add_stat_label() %>%
+  modify_spanning_header(all_stat_cols() ~ "CRS outcome") %>%
+  remove_footnote_header(columns = everything())
+```
+
+Cause of death within nrm groups
+```{r}
+cilta %>%
+  filter(nrm_grp %in% c("Acute toxicity", "Delayed toxicity")) %>%
+  select(nrm_grp, updated_death_cause) %>%
+  tbl_summary(by = nrm_grp) %>%
+  bold_labels() %>%
+  modify_spanning_header(all_stat_cols() ~ "NRM group")
+```
+
+```{r}
+cilta %>%
+  filter(os_event == 1) %>% 
+  select(crs_outcome, updated_death_cause) %>%
+  mutate(updated_death_cause = case_when(
+    updated_death_cause == "myeloma"                   ~ "Myeloma",
+    updated_death_cause == "infection"	                   ~ "Infection",
+    updated_death_cause == "unknown"	                   ~ "Unknown",
+    updated_death_cause == "hlh"                   ~ "Acute toxicity",
+    updated_death_cause == "colitis"                   ~ "Delayed toxicity",
+    updated_death_cause == "crs"                   ~ "Acute toxicity",
+    updated_death_cause == "icans"                   ~ "Acute toxicity",
+    updated_death_cause == "iec-hs/hlh"	                   ~ "Acute toxicity",
+    updated_death_cause == "hepatic gvhd"	                   ~ "Other",
+    updated_death_cause == "infection secondary to iec-colitis"	    ~ "Infection",
+    updated_death_cause == "nint"                   ~ "Delayed toxicity",
+    updated_death_cause == "parkinsonism"                   ~ "Delayed toxicity",
+    updated_death_cause == "spm"	                   ~ "SPM",
+    updated_death_cause == "subdural hematoma"	                   ~ "Other"
+  )) %>% 
+  tbl_summary(by = crs_outcome, sort = everything() ~ "frequency") %>%
+  bold_labels() %>%
+  add_p() %>% bold_p(t = 0.05) %>%
+  # add_overall() %>%
+  add_stat_label() %>%
+  modify_spanning_header(all_stat_cols() ~ "CRS outcome") %>%
+  remove_footnote_header(columns = everything())
+
+
+# a <- cilta %>% filter(os_event == 1) %>% 
+#   select(updated_death_cause, nrm_grp)
+```
+
+## Table 3. Responses
+```{r Table Responses}
+cilta %>%
+  select(day30_response, day30response, day30response_v2, day30response_MRD,
+         mon3_response, mon3response, mon3response_v2, mon3response_MRD,
+         mon6_response, mon6response, mon6response_v2, mon6response_MRD,
+         mon9_response, mon9response, mon9response_v2, mon9response_MRD,
+         mon12_response, mon12response, mon12response_v2, mon12response_MRD,
+         best_response, best_response_MRD,
+         best_ORR, best_CRorbetter,
+         crs_outcome
+         ) %>%
+  tbl_summary(by = crs_outcome,
+    type = list(
+      c(all_dichotomous()
+        )
+      ~"categorical"),
+    statistic = list(all_continuous() ~ "{median} ({min}, {max})"),
+    digits = all_continuous() ~ 1
+  ) %>%
+  bold_labels() %>%
+  add_p() %>% bold_p(t = 0.05) %>%
+  # add_overall() %>%
+  add_stat_label() %>%
+  modify_spanning_header(all_stat_cols() ~ "Responses") %>%
+  remove_footnote_header(columns = everything())
+```
+
+## Survival
+```{r}
+ggsave_workaround <- function(g){
+  survminer:::.build_ggsurvplot(x = g,
+                                surv.plot.height = NULL,
+                                risk.table.height = NULL,
+                                ncensor.plot.height = NULL)}
+```
+### OS
+Median OS
+```{r}
+survfit(Surv(mo_os_from_infusion, os_event) ~ 1, data = cilta)
+survfit(Surv(mo_os_from_infusion, os_event) ~ crs_outcome, data = cilta)
+```
+
+
+```{r Survival analysis - KM by crs_outcome}
+os_fig <- ggsurvplot(survfit(Surv(mo_os_from_infusion, os_event) ~ crs_outcome,
+                   data = cilta),
+           # font.x = c(15, "bold", "black"),
+           # font.y = c(15, "bold", "black"),
+           font.legend = c(12, "plain", "black"),
+           # font.tickslab = c(12, "bold", "black"),
+           # size = 1.5,
+
+           xlab = "Time (months)",
+           ylab = "OS (probability)",
+           legend = "top",
+           legend.title = "Severe early toxicity", legend.labs = c("Yes", "No"),
+           pval = TRUE,
+           conf.int = FALSE,
+           # Censor
+           censor = TRUE
+) %++% guides(colour = guide_legend(nrow = 1))
+os_fig
+# ggsave("OS.tiff",
+#        height = 5,
+#        width = 8,
+#        units = "in",
+#        dpi = 600, compression = "lzw")
+legend <- ggpubr::get_legend(os_fig)
+# # Convert to a ggplot and print
+legend <- ggpubr::as_ggplot(legend)
+legend
+# ggsave("KMs_legend.pdf",
+#        width = 3,
+#        height = 1,
+#        dpi = 600)
+
+myplot <-
+  ggsurvplot(survfit(Surv(mo_os_from_infusion, os_event) ~ crs_outcome,
+                   data = cilta),
+           # font.x = c(15, "bold", "black"),
+           # font.y = c(15, "bold", "black"),
+           font.legend = c(12, "plain", "black"),
+           # font.tickslab = c(12, "bold", "black"),
+           # size = 1.5,
+
+           xlab = "Time (months)",
+           ylab = "OS (probability)",
+           legend = "none",
+           legend.title = "Risk group", legend.labs = c("Severe", "Low"),
+           pval = TRUE, pval.size = 4,
+           conf.int = FALSE,
+           risk.table = TRUE,
+           risk.table.fontsize = 4,
+           tables.y.text = FALSE, 
+           tables.theme = theme_classic()+
+             theme(text = element_text(size = 10),
+                   # plot.title = element_text(size = 10),  # Table title ("Number at risk")
+                   axis.text.x = element_text(size = 12),                # Time ticks (x-axis)
+                   axis.title.y = element_text(size = 13), 
+                   axis.title.x = element_text(size = 12)                # X-axis label ("Time")
+             ),
+           # Censor
+           censor = TRUE
+) %++% guides(colour = guide_legend(nrow = 1))
+myplot$table <- myplot$table + labs(y = "")
+
+os_fig_table <- ggsave_workaround(myplot)
+
+# ggsave("OS with risk table.tiff",
+#        plot = os_fig_table,
+#        height = 7,
+#        width = 8,
+#        units = "in",
+#        dpi = 600, compression = "lzw")
+
+coxph(Surv(time = cilta$mo_os_from_infusion,
+                   event = cilta$os_event) ~ crs_outcome,
+              data = cilta)  %>%
+  tbl_regression(exponentiate = TRUE) %>%
+  bold_p(t = .05) %>%
+  add_nevent(location = "level") %>% add_n(location = "level") %>% as_gt()
+```
+
+### PFS
+Median PFS
+```{r}
+survfit(Surv(mo_pfs_from_infusion, pfs_event) ~ 1, data = cilta)
+survfit(Surv(mo_pfs_from_infusion, pfs_event) ~ crs_outcome, data = cilta)
+```
+
+```{r PFS analysis - KM by crs_outcome}
+pfs_fig <- ggsurvplot(survfit(Surv(mo_pfs_from_infusion, pfs_event) ~ crs_outcome,
+                   data = cilta),
+           # font.x = c(15, "bold", "black"),
+           # font.y = c(15, "bold", "black"),
+           font.legend = c(12, "plain", "black"),
+           # font.tickslab = c(12, "bold", "black"),
+           # size = 1.5,
+
+           xlab = "Time (months)",
+           ylab = "PFS (probability)",
+           legend = "top",
+           legend.title = "Risk group", legend.labs = c("Severe", "Low"),
+           pval = TRUE,
+           conf.int = FALSE,
+           # Censor
+           censor = TRUE
+) %++% guides(colour = guide_legend(nrow = 1))
+pfs_fig
+# ggsave("PFS.tiff",
+#        height = 5,
+#        width = 8,
+#        units = "in",
+#        dpi = 600, compression = "lzw")
+
+myplot <- ggsurvplot(survfit(Surv(mo_pfs_from_infusion, pfs_event) ~ crs_outcome,
+                   data = cilta),
+           # font.x = c(15, "bold", "black"),
+           # font.y = c(15, "bold", "black"),
+           font.legend = c(12, "plain", "black"),
+           # font.tickslab = c(12, "bold", "black"),
+           # size = 1.5,
+
+           xlab = "Time (months)",
+           ylab = "PFS (probability)",
+           legend = "none",
+           legend.title = "Risk group", legend.labs = c("Severe", "Low"),
+           pval = TRUE, pval.size = 4,
+           conf.int = FALSE,
+           risk.table = TRUE,
+           risk.table.fontsize = 3,
+           tables.y.text = FALSE,
+           tables.theme = theme_classic()+
+             theme(text = element_text(size = 10),
+                   # plot.title = element_text(size = 10),  # Table title ("Number at risk")
+                   axis.text.x = element_text(size = 12),                # Time ticks (x-axis)
+                   axis.title.y = element_text(size = 13), 
+                   axis.title.x = element_text(size = 12)                # X-axis label ("Time")
+             ),
+) %++% guides(colour = guide_legend(nrow = 1))
+myplot$table <- myplot$table + labs(y = "")
+
+pfs_fig_table <- ggsave_workaround(myplot)
+
+# ggsave("PFS with risk table.tiff",
+#        plot = pfs_fig_table,
+#        height = 7,
+#        width = 8,
+#        units = "in",
+#        dpi = 600, compression = "lzw")
+
+coxph(Surv(time = cilta$mo_pfs_from_infusion,
+                   event = cilta$pfs_event) ~ crs_outcome,
+              data = cilta)  %>%
+  tbl_regression(exponentiate = TRUE) %>%
+  bold_p(t = .05) %>%
+  add_nevent(location = "level") %>% add_n(location = "level")
+```
+
+# NRM
+<!-- Cause of death within nrm groups -->
+<!-- ```{r} -->
+<!-- cilta %>% -->
+<!--   # filter(nrm_grp %in% c("Acute toxicity", "Delayed toxicity")) %>% -->
+<!--   select(nrm_grp, updated_death_cause) %>% -->
+<!--   tbl_summary(by = nrm_grp) %>% -->
+<!--   bold_labels() %>% -->
+<!--   modify_spanning_header(all_stat_cols() ~ "NRM group") -->
+<!-- ``` -->
+
+```{r}
+a <- cilta %>% filter(!is.na(nrm_grp)) %>% 
+  select(patientid, nrm_grp, nrm, os_event, updated_death_cause, progression_dt) %>% 
+  filter(nrm_grp %in% c("Other", "Spm"))
+
+cilta <- cilta %>% 
+  mutate(nrm = case_when(
+    is.na(nrm) &
+      updated_death_cause == "unknown"     ~ 1,
+    !is.na(nrm)                            ~ nrm
+  ))
+```
+
+
+```{r, fig.height=6}
+nrm_fig <- ggsurvplot(survfit(Surv(mo_os_from_infusion, nrm) ~ crs_outcome,
+                   data=cilta),
+           fun = "event",
+           # font.x = c(12, "plain", "black"),
+           # font.y = c(12, "plain", "black"),
+           font.legend = c(12, "plain", "black"),
+           # font.tickslab = c(10, "plain", "black"),
+           # size = 1.5,
+           surv.median.line = "hv",
+
+           xlab = "Time (months)",
+           ylab = "Cumulative Incidence of NRM",
+           legend = "top", 
+           legend.title = "Risk group",
+           legend.labs = c("Severe", "Low"),
+           pval = TRUE, #pval.size = 4,
+           conf.int = FALSE,
+           # Censor
+           censor = TRUE
+) %++% guides(colour = guide_legend(ncol = 3))
+nrm_fig
+# ggsave("Cumulative incidence.tiff",
+#        height = 5,
+#        width = 8,
+#        units = "in",
+#        dpi = 600, compression = "lzw")
+
+myplot <- ggsurvplot(survfit(Surv(mo_os_from_infusion, nrm) ~ crs_outcome,
+                   data=cilta),
+           fun = "event",
+           # font.main = c(20, "bold", "black"),
+           # font.x = c(12, "plain", "black"),
+           # font.y = c(12, "plain", "black"),
+           font.legend = c(12, "plain", "black"),
+           # font.tickslab = c(10, "plain", "black"),
+           # size = 1.5,
+           surv.median.line = "hv",
+
+           xlab = "Time (months)",
+           ylab = "Cumulative Incidence of NRM",
+           legend = "none", legend.title = "Risk group",
+           legend.labs = c("Severe", "Low"),
+           pval = TRUE, pval.size = 4,
+           conf.int = FALSE,
+           risk.table = TRUE,
+           risk.table.fontsize = 3,
+           tables.y.text = FALSE,
+           tables.theme = theme_classic()+
+             theme(text = element_text(size = 10),
+                   # plot.title = element_text(size = 10),  # Table title ("Number at risk")
+                   axis.text.x = element_text(size = 12),                # Time ticks (x-axis)
+                   axis.title.y = element_text(size = 13), 
+                   axis.title.x = element_text(size = 12)                # X-axis label ("Time")
+             ),
+           # Censor
+           censor = TRUE
+) %++% guides(colour = guide_legend(ncol = 3))
+myplot$table <- myplot$table + labs(y = "")
+nrm_fig_table <- ggsave_workaround(myplot)
+
+# ggsave("Cumulative incidence with risk table.tiff",
+#        plot = myplot_fig,
+#        height = 7,
+#        width = 8,
+#        units = "in",
+#        dpi = 600, compression = "lzw")
+```
+
+```{r patchwork}
+library(patchwork)
+
+os_fig[["plot"]] /
+  pfs_fig[["plot"]] /
+  nrm_fig[["plot"]] + plot_annotation(tag_levels = 'A')+
+  plot_layout(axis_titles = "collect", guides = "collect") &
+  theme(plot.tag = element_text(size = 21),
+        text = element_text(size = 13),
+        legend.position = "bottom")
+# ggsave("Curve panel figure_20260715.tiff",
+#        height = 12,
+#        width = 8,
+#        units = "in",
+#        dpi = 600, compression = "lzw")
+
+
+# os_fig_table + pfs_fig_table + nrm_fig_table+
+# plot_annotation(tag_levels = "A")+
+#   plot_layout(axis_titles = "collect", guides = "collect") &
+#   theme(plot.tag = element_text(size = 21),
+#         text = element_text(size = 13),
+#         axis.title = element_text(size = 15),
+#         axis.text = element_text(size = 13), 
+#         legend.position = "bottom",
+#         legend.text = element_text(size = 15), 
+#         legend.title = element_text(size = 15))
+
+
+# list(
+#   ggsurvfit::ggsurvfit_build(os_fig_table),
+#   ggsurvfit::ggsurvfit_build(pfs_fig_table),
+#   ggsurvfit::ggsurvfit_build(nrm_fig_table)
+# ) |> 
+#   wrap_plots(nrow = 1) +
+#   plot_annotation(tag_levels = "A"#, theme = theme(plot.margin = margin(t = 30))
+#                   )+
+#   plot_layout() &
+#   theme(plot.tag = element_text(size = 21, margin = margin(t = -50)),
+#         text = element_text(size = 13),
+#         axis.title = element_text(size = 15),
+#         axis.text = element_text(size = 13), 
+#         plot.margin =  margin(t = 20),
+#         legend.text = element_text(size = 15), 
+#         legend.title = element_text(size = 15))
+
+list(
+  ggsurvfit::ggsurvfit_build(os_fig_table),
+  ggsurvfit::ggsurvfit_build(pfs_fig_table),
+  ggsurvfit::ggsurvfit_build(nrm_fig_table)
+) |> 
+  wrap_plots(nrow = 1) /
+  # (legend + theme(plot.margin = unit(c(-5,0,0,0), "cm"))
+  #  ) +
+  inset_element(legend, left = 0.3, bottom = 0, right = 0.7, top = -0.06, align_to = "full")+
+  plot_annotation(tag_levels = list(c("A", "B", "C", NULL)))+
+  plot_layout(axis_titles = "collect", guides = "collect") &
+  theme(plot.tag = element_text(size = 21, margin = margin(t = -50)),
+        text = element_text(size = 13),
+        axis.title = element_text(size = 15),
+        axis.text = element_text(size = 13), 
+        plot.margin =  margin(t = 20, b = 30),
+        legend.text = element_text(size = 15), 
+        legend.title = element_text(size = 15))
+# ggsave("Curve panel figure with table_20260715.tiff",
+#        height = 6,
+#        width = 13,
+#        units = "in",
+#        dpi = 600, compression = "lzw")
+
+```
+
+
+
+
+
+
+```{r select vars}
+limited_cilta <- limited_cilta %>% 
+  
+  select(ecog_at_ld_cat,
+         bsln_bmpc_cat25,
+         # bsln_bmpc_cat65,
+         # bsln_bmpc, 
+         # bmpc_cat,
+         cytogenetics,
+         bridging_response_prbetter,
+         pentaref, 
+         bsln_crp_cat05,
+         # labs_bsln_crp,
+         # labs_bsln_ferritin, 
+         bsln_ferr_cat400,
+         crs_outcome)
+```
+
+# Stepwise regression / full cohort complete case
+```{r stepwise regression, echo = TRUE, class.source= 'fold-hide'}
+dat_df <- limited_cilta %>% 
+    mutate(crs_outcome_glm = case_when(
+    crs_outcome == "Severe - 0"      ~ 0,
+    crs_outcome == "Low - 1"         ~ 1
+  )) %>% 
+  select(-crs_outcome) %>% 
+  as.data.frame()
+
+dat_factor <- dat_df %>% 
+  mutate(crs_outcome_glm = factor(crs_outcome_glm, levels = c("0", "1")))
+
+formula <- crs_outcome_glm ~ .
+set.seed(1234)
+res_complete_case <-
+  stepwise(formula = formula,
+           data = dat_factor,
+           type = "logit",
+           # include = "pentaref",
+           strategy = "bidirection",
+           metric = c("AIC", "SL"),
+           sle=0.90,   #enters all since we already limited based on UVA
+           sls=0.15)    # stays if pvalue < 0.10
+res_complete_case
+summary(res_complete_case$bidirection$AIC)
+```
+
+
+```{r}
+report(res_complete_case, report_name = paste0(here::here(),
+                                               "/Rmd/stepresults",
+                                               "/stepwise_report_no_missing_bootval_", today()), format = "html")
+```
+
+Using the `r res_complete_case[["performance"]][["strategy:metric"]][1]` strategy, the voted model is   
+`r res_complete_case[["performance"]][["model"]][1]`.   
+
+
+## Modeling using complete cases data 
+```{r,}
+model_term <- res_complete_case[["performance"]][["model"]][1]
+```
+The final model is `r model_term`
+
+```{r echo = TRUE, class.source= 'fold-hide'}
+# Build original regression results to compare with bootstrap later
+set.seed(123)
+model_glm <- 
+  glm(model_term, 
+      data = dat_df, 
+      family = "binomial")
+
+reg_results <- model_glm %>% 
+  tbl_regression(exponentiate=TRUE) %>% 
+  bold_labels() %>% 
+  bold_p(t = .05) %>% 
+  add_nevent(location = "level") %>% add_n(location = "level")
+reg_results
+```
+
+
+# Bootstrap with boot()
+Proceed with bootstrapping on our original data set for 1000 replicates.
+```{r bootstrap validation with boot(), echo = TRUE, class.source= 'fold-show'}
+# Bootstrap
+library(Hmisc)
+boot_reg <- function(data, index){
+  model <- glm(model_term, family = binomial, 
+           data = data[index,])
+  # train
+  return(coef(model))
+}
+library(boot)
+set.seed(123)
+boot_results <- boot(data = dat_df, statistic = boot_reg, R = 1000)
+boot_results
+```
+<br>
+
+## Estimate and CI correction
+### Estimate correction
+```{r get estimate correction, echo = TRUE, class.source= 'fold-show'}
+original_estimates <- boot_results$t0 
+calculated_bias <- colMeans(boot_results$t) - boot_results$t0 
+bias_corrected_estimates <- original_estimates - calculated_bias 
+print(bias_corrected_estimates)
+
+cor_est <-
+  exp(bias_corrected_estimates) %>% 
+  as_tibble(rownames = "labels") %>% 
+    filter(labels != "(Intercept)") %>% 
+    mutate(labels = case_when(
+      labels == "bsln_bmpc_cat25bsln_bmpc ≥ 25"            ~ "bsln_bmpc ≥ 25",
+      labels == "bridging_response_prbetter< PR"           ~ "< PR",
+      labels == "bridging_response_prbetterPR or better"   ~ "PR or better",
+      labels == "bsln_ferr_cat400bsln_ferr ≥ 400"          ~ "bsln_ferr ≥ 400",
+      labels == "ecog_at_ld_cat2-4"                        ~ "2-4",
+      labels == "bsln_crp_cat05bsln_crp ≥ 0.5"             ~ "bsln_crp ≥ 0.5",
+      labels == "cytogeneticsYes"                          ~ "Yes"
+    ))
+```
+
+### CI correction
+```{r get ci correction, echo = TRUE, class.source= 'fold-show'}
+ci_bsln_bmpc_25 <- boot.ci(boot_results, type = "bca", index = 2)
+ci_bsln_bmpc_25 <- exp(ci_bsln_bmpc_25[["bca"]][4:5])
+ci_prbetter_PR <- boot.ci(boot_results, type = "bca", index = 3)
+ci_prbetter_PR <- exp(ci_prbetter_PR[["bca"]][4:5])
+ci_PR_better <- boot.ci(boot_results, type = "bca", index = 4)
+ci_PR_better <- exp(ci_PR_better[["bca"]][4:5])
+ci_bsln_ferr_400 <- boot.ci(boot_results, type = "bca", index = 5)
+ci_bsln_ferr_400 <- exp(ci_bsln_ferr_400[["bca"]][4:5])
+ci_ecog <- boot.ci(boot_results, type = "bca", index = 6)
+ci_ecog <- exp(ci_ecog[["bca"]][4:5])
+ci_crp <- boot.ci(boot_results, type = "bca", index = 7)
+ci_crp <- exp(ci_crp[["bca"]][4:5])
+ci_cyto <- boot.ci(boot_results, type = "bca", index = 8)
+ci_cyto <- exp(ci_cyto[["bca"]][4:5])
+cor_ci <-
+  bind_rows(as_tibble(ci_bsln_bmpc_25, rownames = "label") %>% mutate(labels = "bsln_bmpc ≥ 25"), 
+            as_tibble(ci_prbetter_PR, rownames = "label") %>% mutate(labels = "< PR"),
+            as_tibble(ci_PR_better, rownames = "label") %>% mutate(labels = "PR or better"),
+            as_tibble(ci_bsln_ferr_400, rownames = "label") %>% mutate(labels = "bsln_ferr ≥ 400"),
+            as_tibble(ci_ecog, rownames = "label") %>% mutate(labels = "2-4"),
+            as_tibble(ci_crp, rownames = "label") %>% mutate(labels = "bsln_crp ≥ 0.5"),
+            as_tibble(ci_cyto, rownames = "label") %>% mutate(labels = "Yes")
+  ) %>% 
+  mutate(label = case_when(
+    label == "1"         ~ "lower",
+    label == "2"         ~ "upper",
+  )) %>% 
+  pivot_wider(id_cols = labels , 
+              names_from = "label", 
+              values_from = "value")
+
+corrected_results <- 
+  cor_est %>% 
+  left_join(., cor_ci, by = "labels") %>% 
+  mutate(OR_corrected = paste0("OR, ", round(value, 3), ", 95% CI, ", round(lower, 3), "-", round(upper, 3))) %>% 
+  select(-c(value, lower, upper))
+```
+<br>
+
+### Estimate and CI comparison table
+```{r}
+reg_results %>% 
+  as_tibble() %>% 
+  `colnames<-`(str_remove_all(colnames(.), "\\*")) %>% 
+  separate(`95% CI`, into = c("lower", "upper"), sep = ", ") %>% 
+  mutate(N = case_when(
+    !is.na(N)          ~ N,
+    is.na(N)           ~ "label"
+  )) %>% 
+  mutate(OR_original = paste0("OR, ", OR, ", 95% CI, ", lower, "-", upper)) %>% 
+  select(-c(OR, lower, upper, `p-value`)) %>% 
+  mutate(OR_original = case_when(
+    N == "label"                          ~ NA_character_,
+    str_detect(OR_original, "NA-NA")      ~ "Reference",
+    TRUE                                  ~ OR_original
+  )) %>% 
+  left_join(., corrected_results, by = c("Characteristic" = "labels")) %>% 
+  mutate(N = case_when(
+    N == "label"                          ~ NA_character_,
+    TRUE                                  ~ N
+  )) %>% 
+  mutate(across(everything(), ~ replace_na(as.character(.x), ""))) %>% 
+  kableExtra::kbl() %>% # Removes NAs locally
+  kableExtra::kable_styling()
+```
+
+
+## AUC bootstrap
+```{r bootstrap auc, echo = TRUE, class.source= 'fold-show'}
+# Bootstrap
+boot_auc <- function(data, index){
+  data_ind <- data[index,]
+  model <- glm(model_term, family = binomial, 
+           data = data_ind)
+  set.seed(123)
+  predict_prob <- 
+    predict(model_glm, newdata = data_ind, type = "response")
+  predict_roc <- 
+    roc(data_ind$crs_outcome_glm ~ predict_prob, plot = FALSE, print.auc = FALSE)
+  
+  return(as.numeric(predict_roc$auc))
+}
+library(boot)
+set.seed(123)
+boot_results <- boot(data = dat_df, statistic = boot_auc, R = 1000)
+boot_results
+
+original_estimates <- boot_results$t0 
+calculated_bias <- colMeans(boot_results$t) - boot_results$t0 
+bias_corrected_estimates <- original_estimates - calculated_bias 
+# print(bias_corrected_estimates)
+```
+
+
+### AUC comparison
+```{r comparison auc}
+tibble(model = c("Original", "Bootstrap"),
+       AUC = c(original_estimates,bias_corrected_estimates), .rows = )
+
+```
+
+### Figure AUC model built on full cohort
+```{r auc, echo = TRUE, class.source= 'fold-show'}
+set.seed(123)
+model_glm <- 
+  glm(model_term, 
+      data = dat_df, 
+      family = "binomial")
+set.seed(123)
+predict_prob <- 
+  predict(model_glm, newdata = dat_df, type = "response")
+# tiff("Figures/Train ROC_20260709.tiff", width = 6, height = 6, units = 'in', res = 300, type = "cairo", compression = 'lzw')
+predict_roc <- 
+  roc(dat_df$crs_outcome_glm ~ predict_prob, plot = TRUE, print.auc = TRUE)
+# dev.off()
+auc_value <- round(auc(predict_roc), 3)
+ggroc(predict_roc, legacy.axes = TRUE, size = 1) +
+  # Add the identity/diagonal reference line (equivalent to standard plot defaults)
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+  
+  # Print the AUC onto the plot (Replicates print.auc = TRUE)
+  annotate("text", x = 0.4, y = 0.35, hjust = 0,
+           label = paste0("Apparent AUC = ", auc_value), 
+           size = 4, fontface = "plain") +
+  annotate("text", x = 0.4, y = 0.3, hjust = 0,
+           label = paste0("Optimism-corrected AUC = ", round(bias_corrected_estimates, 3)), 
+           size = 4, fontface = "plain") +
+  
+  # Clean up axis labels and apply a clean theme
+  labs(x = "False Positive Rate (1 - Specificity)",
+       y = "True Positive Rate (Sensitivity)")
+
+# ggsave("Figures/ROCAUC_20260715.tiff",
+#        dpi = 600, units = "in",
+#        width = 6,
+#        height = 6, compression = "lzw"
+#        )
+```
+
+### Figure Conf matrix model built on full cohort
+```{r Conf matrix, echo = TRUE, class.source= 'fold-show'}
+truth = dat_df$crs_outcome_glm
+
+pred = ifelse(predict_prob > 0.5, "1", "0")
+
+train_tab = table(predicted = pred, actual = truth)
+train_con_mat = confusionMatrix(train_tab, positive = "1")
+c(train_con_mat$overall["Accuracy"],
+  train_con_mat$byClass["Sensitivity"],
+  train_con_mat$byClass["Specificity"])
+```
+
+```{r}
+conf_tab <- train_tab / rowSums(train_tab)
+conf_tab <- as.data.frame(conf_tab, stringsAsFactors = TRUE)
+conf_tab$actual <- factor(conf_tab$actual, rev(levels(conf_tab$actual)))
+
+ggplot(conf_tab, aes(predicted, actual, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = scales::percent(Freq)), size = 3) +
+  scale_fill_gradient(low = "white", high = "#3575b5")+
+  labs(x = "Expected", y = "Predicted", 
+       fill = "Overlap")+
+  theme_classic()+
+  theme(legend.position = "bottom")
+
+# ggsave("Figures/Train confmetric_20260709.tiff",
+#        dpi = 600, units = "in",
+#        width = 6,
+#        height = 6, compression = "lzw"
+#        )
+```
+
+
+
+
