@@ -1125,6 +1125,17 @@ model_term <- res_complete_case[["performance"]][["model"]][1]
 The final model is `r model_term`
 
 ```{r echo = TRUE, class.source= 'fold-hide'}
+dat_df <- dat_df %>% 
+  # mutate(crs_outcome_glm = factor(crs_outcome_glm, levels = c("1", "0"))) %>% 
+  mutate(bsln_bmpc_cat25 = factor(bsln_bmpc_cat25, levels = c("bsln_bmpc ≥ 25", "bsln_bmpc < 25"))) %>% 
+  mutate(bsln_ferr_cat400 = factor(bsln_ferr_cat400, levels = c("bsln_ferr ≥ 400", "bsln_ferr < 400"))) %>% 
+  mutate(ecog_at_ld_cat = factor(ecog_at_ld_cat, levels = c("2-4", "0-1"))) %>% 
+  # mutate(bridging_response_prbetter = factor(bridging_response_prbetter, levels = c("PR or better", "No bridging", "< PR"))) %>% 
+  mutate(bsln_crp_cat05 = factor(bsln_crp_cat05, levels = c("bsln_crp ≥ 0.5", "bsln_crp < 0.5"))) %>% 
+  mutate(cytogenetics = factor(cytogenetics, levels = c("Yes", "No")))
+  
+
+
 # Build original regression results to compare with bootstrap later
 set.seed(123)
 model_glm <- 
