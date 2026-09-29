@@ -823,7 +823,8 @@ var_label(dat_df) <- list(bsln_bmpc_cat25 = "BM PC % at pre-LD",
 <!-- #        ) -->
 <!-- ``` -->
 
-# Identify thresholds/sensitivity/specificity using the full cohort
+# I. Identify thresholds/sensitivity/specificity using the full cohort
+## A. Identify the threshold that maximizes the combined sensitivity + specificity
 ```{r echo = TRUE, class.source= 'fold-hide'}
 model_glm <- 
   glm(model_term, 
@@ -844,9 +845,50 @@ best_youden <- pROC::coords(
 )
 best_youden
 ```
+
+
+
+```{r echo = TRUE, class.source= 'fold-hide'}
+model_glm <- 
+  glm(model_term, 
+      data = dat_df, 
+      family = "binomial")
+predict_prob <- 
+  predict(model_glm, newdata = dat_df, type = "response")
+# Change quiet = TRUE
+predict_roc <- 
+  roc(dat_df$crs_outcome_glm ~ predict_prob, quiet = TRUE)
+
+roc_coords <- pROC::coords(
+  predict_roc,
+  x = "all",
+  ret = c("threshold", "sensitivity", "specificity"),
+  transpose = FALSE
+)
+roc_coords
+```
+
+## B. Identifying under a pre-specified minimum specificity of 90% and selecting thresholds with the highest sensitivity.
+```{r echo = TRUE, class.source= 'fold-hide'}
+# Require specificity ≥ 0.90
+candidate <- roc_coords[roc_coords$specificity >= 0.90, ]
+# Among those thresholds, maximize sensitivity
+optimal <- candidate[which.max(candidate$sensitivity), ]
+optimal
+```
+
+## C. Identifying under a pre-specified minimum specificity of 95% and selecting thresholds with the highest sensitivity.
+```{r echo = TRUE, class.source= 'fold-hide'}
+# Require specificity ≥ 0.90
+candidate <- roc_coords[roc_coords$specificity >= 0.95, ]
+# Among those thresholds, maximize sensitivity
+optimal <- candidate[which.max(candidate$sensitivity), ]
+optimal
+```
 <br>
 
-# Identify thresholds/sensitivity/specificity using bootstrapping on our original data set for 1000 replicates.
+# II. Identify thresholds/sensitivity/specificity using bootstrapping on our original data set for 1000 replicates.
+## A. Identify the threshold that maximizes the combined sensitivity + specificity
 ```{r echo = TRUE, class.source= 'fold-hide'}
 # Bootstrap
 boot_thresh <- function(data, index) {
@@ -904,7 +946,155 @@ bind_rows(original_estimates,bias_corrected_estimates, .id = "model") |>
   ))
 ```
 
-# Build nomogram
+## B. Identifying under a pre-specified minimum specificity of 90% and selecting thresholds with the highest sensitivity.
+```{r}
+# Bootstrap
+boot_thresh <- function(data, index) {
+  # Bootstrap sample
+  data_ind <- data[index, ]
+  # Fit logistic regression
+  model_glm_boot <- glm(
+    model_term,
+    family = binomial,
+    data = data_ind
+  )
+  # Predicted probabilities
+  predict_prob <- predict(model_glm_boot, newdata = data_ind, type = "response")
+  # ROC curve
+  predict_roc <- pROC::roc(response = data_ind$crs_outcome_glm, predictor = predict_prob, quiet = TRUE)
+  # Get threshold requiring specificity ≥90%
+  roc_coords <- pROC::coords(
+    predict_roc,
+    x = "all",
+    ret = c("threshold", "sensitivity", "specificity"),
+    transpose = FALSE
+  )
+  
+  # Keep thresholds achieving ≥90% specificity
+  candidate <- roc_coords[
+    roc_coords$specificity >= 0.90,
+  ]
+  
+  # Select threshold with highest sensitivity
+  optimal_90 <- candidate[
+    which.max(candidate$sensitivity),
+  ]
+  
+  specificity90_threshold <- as.numeric(
+    optimal_90[["threshold"]]
+  )
+  
+  specificity90_sensitivity <- as.numeric(
+    optimal_90[["sensitivity"]]
+  )
+  
+  specificity90_specificity <- as.numeric(
+    optimal_90[["specificity"]]
+  )
+  
+  # Return EXACTLY 3 numbers
+  c(
+    specificity90_threshold = specificity90_threshold,
+    specificity90_sensitivity = specificity90_sensitivity,
+    specificity90_specificity = specificity90_specificity
+  )
+}
+
+library(boot)
+
+set.seed(123)
+boot_results <- boot(data = dat_df, statistic = boot_thresh, R = 1000)
+# boot_results
+
+original_estimates <- boot_results$t0 
+calculated_bias <- colMeans(boot_results$t) - boot_results$t0 
+bias_corrected_estimates <- original_estimates - calculated_bias 
+```
+
+threshold/sensitivity/specificity comparison
+```{r}
+bind_rows(original_estimates,bias_corrected_estimates, .id = "model") |> 
+  mutate(model = case_when(
+    model == 1    ~ "Original",
+    model == 2    ~ "Bootstrap"
+  ))
+```
+
+## C. Identifying under a pre-specified minimum specificity of 95% and selecting thresholds with the highest sensitivity.
+```{r}
+# Bootstrap
+boot_thresh <- function(data, index) {
+  # Bootstrap sample
+  data_ind <- data[index, ]
+  # Fit logistic regression
+  model_glm_boot <- glm(
+    model_term,
+    family = binomial,
+    data = data_ind
+  )
+  # Predicted probabilities
+  predict_prob <- predict(model_glm_boot, newdata = data_ind, type = "response")
+  # ROC curve
+  predict_roc <- pROC::roc(response = data_ind$crs_outcome_glm, predictor = predict_prob, quiet = TRUE)
+  # Get threshold requiring specificity ≥95%
+  roc_coords <- pROC::coords(
+    predict_roc,
+    x = "all",
+    ret = c("threshold", "sensitivity", "specificity"),
+    transpose = FALSE
+  )
+  
+  # Keep thresholds achieving ≥95% specificity
+  candidate <- roc_coords[
+    roc_coords$specificity >= 0.95,
+  ]
+  
+  # Select threshold with highest sensitivity
+  optimal_95 <- candidate[
+    which.max(candidate$sensitivity),
+  ]
+  
+  specificity95_threshold <- as.numeric(
+    optimal_95[["threshold"]]
+  )
+  
+  specificity95_sensitivity <- as.numeric(
+    optimal_95[["sensitivity"]]
+  )
+  
+  specificity95_specificity <- as.numeric(
+    optimal_95[["specificity"]]
+  )
+  
+  # Return EXACTLY 3 numbers
+  c(
+    specificity95_threshold = specificity95_threshold,
+    specificity95_sensitivity = specificity95_sensitivity,
+    specificity95_specificity = specificity95_specificity
+  )
+}
+
+library(boot)
+
+set.seed(123)
+boot_results <- boot(data = dat_df, statistic = boot_thresh, R = 1000)
+# boot_results
+
+original_estimates <- boot_results$t0 
+calculated_bias <- colMeans(boot_results$t) - boot_results$t0 
+bias_corrected_estimates <- original_estimates - calculated_bias 
+```
+
+threshold/sensitivity/specificity comparison
+```{r}
+bind_rows(original_estimates,bias_corrected_estimates, .id = "model") |> 
+  mutate(model = case_when(
+    model == 1    ~ "Original",
+    model == 2    ~ "Bootstrap"
+  ))
+```
+
+# III. Build nomogram
 nomogram() takes the fitted logistic regression model and converts the regression coefficients into a visual point-based prediction.   
 
 Detailed point assignments:
@@ -953,15 +1143,15 @@ nom <- nomogram(
   abbrev = FALSE
 )
 
-tiff(
-  "Figures/Nomogram_20260918.tiff",
-  width = 9,
-  height = 6,
-  units = "in",
-  res = 600,
-  compression = "lzw",
-  bg = "white"
-)
+# tiff(
+#   "Figures/Nomogram_20260918.tiff",
+#   width = 9,
+#   height = 6,
+#   units = "in",
+#   res = 600,
+#   compression = "lzw",
+#   bg = "white"
+# )
 plot(nom,
      xfrac = 0.35, # horizontal space is reserved for the variable labels
      cex.axis = 0.7, # size of the numbers
@@ -971,6 +1161,6 @@ plot(nom,
      col.conf = gray(0.5),
      tcl = -0.2 # tick marks length - < 0 is point inward
 )
-dev.off()
+# dev.off()
 ```
 
